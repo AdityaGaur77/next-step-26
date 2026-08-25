@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: pytest -q
+
+      - name: Bundle regeneration check
+        run: |
+          python tools/build_plugin.py
+          git diff --exit-code plugin/ecoslice_core.py || (echo "::error::plugin/ecoslice_core.py is stale - run tools/build_plugin.py and commit" && exit 1)
+
+      - name: Offline demo smoke
+        run: python tools/offline_demo.py --resolution 32 --json

@@ -1,5 +1,7 @@
 # EcoSlice
 
+[![CI](https://github.com/AdityaGaur77/next-step-26/actions/workflows/ci.yml/badge.svg)](https://github.com/AdityaGaur77/next-step-26/actions/workflows/ci.yml)
+
 **Load-aware walls & infill for OrcaSlicer.** Slicers know the *shape* of a part — never its *job*.
 EcoSlice closes that gap: you describe what the part must do ("shelf bracket holding 8 kg, screwed
 to the left wall"), it runs a real voxel FEM simulation on your model, and locally reinforces
