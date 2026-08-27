@@ -12,6 +12,20 @@ ones that bit us: the obvious Python-shaped guess is wrong.
 - During load the host calls **`register_capabilities()`**; inside it call
   **`orca.register_capability(Cls)`** once per capability.
 - Loader refuses `.py` plugins whose PEP 723 metadata lacks **`name`** (PluginLoader.cpp).
+  ⚠️ Identity keys live in a **`[tool.orcaslicer.plugin]`** TOML table inside the PEP 723
+  block (PluginFsUtils.cpp `parse_pep723_toml`) — top-level `name`/`version` are IGNORED:
+  ```python
+  # /// script
+  # requires-python = ">=3.12"
+  # dependencies = []
+  #
+  # [tool.orcaslicer.plugin]
+  # name = "My Plugin"      # REQUIRED or install fails
+  # version = "1.0.0"
+  # description = "..."
+  # author = "..."
+  # ///
+  ```
   Dependencies come from the PEP 723 `dependencies` list, installed with bundled **uv**
   (`uv pip install --target`, 120 s timeout) — keep the list short.
 - ⚠️ **`get_default_config()` must return a dict**, not a JSON string. The trampoline

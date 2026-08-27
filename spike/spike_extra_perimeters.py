@@ -1,9 +1,12 @@
 # /// script
+# requires-python = ">=3.12"
+# dependencies = []
+#
+# [tool.orcaslicer.plugin]
 # name = "EcoSlice Spike"
 # version = "0.3.0"
 # description = "Day-1 gate: prove pipeline-graph mutation changes G-code (verified API shape)"
-# requires-python = ">=3.12"
-# dependencies = []
+# author = "EcoSlice contributors"
 # ///
 # EcoSlice day-1 spike against the REAL OrcaSlicer plugin contract
 # (verified in OrcaSlicer/src/slic3r/plugin/, see docs/PLUGIN_API_NOTES.md):

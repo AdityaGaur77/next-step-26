@@ -45,3 +45,31 @@ behavior on the installed nightly.
 - `plugin/ecoslice_core.py` adapter: replace hook-name sniffing with the real registration API
   observed in the nightly (update `tools/build_plugin.py` ADAPTER section accordingly).
 - Add the observed ctx shape to `tests/mocks.py` so mocks mirror reality.
+
+## Result — 2026-08-26 — **GO**
+
+nightly: `2.5.0-dev` (date: 2026-08-26), test part: 100×10×10 mm cube, 0.16 mm layers
+
+| probe | result |
+|---|---|
+| mesh via `ModelVolume.mesh()` | needs `numpy` declared in plugin deps (`ImportError` otherwise) |
+| `fill_surfaces.surfaces` yields Surface refs | ok — via `collection.surfaces` (layer z=0.2) |
+| `extra_perimeters` write | **MUTATION OK** (0 -> 2) |
+| `surface_type = SurfaceType.stInternalSolid` | **MUTATION OK** (stBottom -> stInternalSolid, `is_solid_now: true`) |
+| plan lands on the part (root thicker, not tip) | n/a — single-surface probe; mutation confirmed live |
+| G-code changes | yes — 402 KB -> 1.14 MB (~2.8x toolpaths), est. 40m -> 1h54m |
+
+Decision matrix row 1 applies: **extra_perimeters changes G-code -> GO for full Idea 1 as built.**
+
+Hard-won host facts (now in `docs/PLUGIN_API_NOTES.md`):
+- Manual copy into `orca_plugins/` no longer works — discovery finds 0 manifests. Install via
+  **Plugins dialog -> Local install** (host creates the folder + manifest sidecar itself).
+- PEP 723 identity keys (`name`/`version`/...) must sit in a **`[tool.orcaslicer.plugin]`**
+  TOML table; top-level keys are ignored and missing `name` fails the install.
+- Installed plugins need the **Activate toggle** in the Plugins dialog (plugin-level
+  `enabled` in `.install_state.json`).
+- Capabilities are picker-selected per process profile: Process settings -> **Others** page ->
+  **Slicing Pipeline Plugin** group (drives the `slicing_pipeline_plugin` config option; the
+  C++ hook skips everything if it is empty).
+- `psGCodePostProcess` rewrites a temp `.pp` copy before it becomes the exported file —
+  appending markers works and survives export; idempotency still required.

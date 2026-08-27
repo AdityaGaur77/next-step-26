@@ -1,12 +1,15 @@
 # /// script
-# name = "EcoSlice"
-# version = "0.1.0"
-# description = "Load-aware walls & infill: FEM-driven localized reinforcement inside OrcaSlicer"
 # requires-python = ">=3.12"
 # dependencies = [
 #   "numpy>=1.26",
 #   "scipy>=1.11",
 # ]
+#
+# [tool.orcaslicer.plugin]
+# name = "EcoSlice"
+# version = "0.1.0"
+# description = "Load-aware walls & infill: FEM-driven localized reinforcement inside OrcaSlicer"
+# author = "EcoSlice contributors"
 # ///
 # EcoSlice Core - load-aware walls & infill for OrcaSlicer.
 # Copyright (C) 2026 EcoSlice contributors. License AGPL-3.0-or-later.
