@@ -7,7 +7,7 @@ name = "ecoslice"
 version = "0.1.0"
 description = "EcoSlice - load-aware walls & infill for OrcaSlicer: FEM-driven localized reinforcement where a part's job demands it, material removal everywhere else."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "EcoSlice contributors" }]
 dependencies = ["numpy>=1.26", "scipy>=1.11"]
@@ -22,3 +22,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src", "tests"]

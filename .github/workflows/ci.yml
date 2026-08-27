@@ -28,9 +28,14 @@ jobs:
         run: pytest -q
 
       - name: Bundle regeneration check
+        # ast.unparse output can differ between interpreter versions, so pin the
+        # bundle check to one matrix entry instead of comparing across all four.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         run: |
           python tools/build_plugin.py
           git diff --exit-code plugin/ecoslice_core.py || (echo "::error::plugin/ecoslice_core.py is stale - run tools/build_plugin.py and commit" && exit 1)
 
       - name: Offline demo smoke
-        run: python tools/offline_demo.py --resolution 32 --json
+        run: |
+          python tools/offline_demo.py --resolution 32 --json
+          python tools/offline_demo.py --part bracket --resolution 24 --json

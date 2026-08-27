@@ -45,7 +45,8 @@ def test_compare(tmp_path):
     assert cmp["delta_filament_g"] == pytest.approx(-1.84)
     assert cmp["delta_co2e_g_virgin_pla"] == pytest.approx(-10.60, abs=0.05)
     assert cmp["delta_time_normal_s"] == pytest.approx(-218.0)
-    assert cmp["delta_energy_kwh_at_100w"] == pytest.approx(0.0061, abs=1e-3)
+    assert cmp["energy_saved_kwh_at_100w"] == pytest.approx(0.0061, abs=1e-3)
+    assert cmp["delta_filament_g"] < 0 < cmp["energy_saved_kwh_at_100w"]
 
 
 def test_assert_lighter_exit_code(tmp_path):

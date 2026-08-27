@@ -42,11 +42,19 @@ try:
 except ImportError:
     orca = None
 
-import json as _adapter_json
 from pathlib import Path as _AdapterPath
 
 PLUGIN_NAME = "EcoSlice"
 PLUGIN_VERSION = __version__
+
+DEFAULT_CONFIG = {
+    "description": "shelf bracket holding 8 kg, load downward; screwed to left wall",
+    "resolution": 32,
+    "add_perimeters": 2,
+    "max_extra_perimeters": 4,
+    "enable_solid_infill": True,
+    "enable_relax": True,
+}
 
 
 def create_pipeline(**kwargs) -> EcoSlicePipeline:
@@ -73,31 +81,24 @@ def describe() -> dict:
     }
 
 
-DEFAULT_CONFIG_JSON = (
-    "{{"
-    "\\"description\\": \\"shelf bracket holding 8 kg, load downward; screwed to left wall\\", "
-    "\\"resolution\\": 40, "
-    "\\"add_perimeters\\": 2, "
-    "\\"max_extra_perimeters\\": 4, "
-    "\\"enable_solid_infill\\": true, "
-    "\\"enable_relax\\": true"
-    "}}"
-)
-
-
 def _apply_config(pipe: EcoSlicePipeline, cfg_json: str) -> None:
     try:
-        cfg = _adapter_json.loads(cfg_json or "{}")
+        cfg = json.loads(cfg_json or "{}")
     except Exception:
         cfg = {}
-    pipe.description = str(cfg.get("description", pipe.description or ""))
-    if isinstance(cfg.get("resolution"), int) and 8 <= cfg["resolution"] <= 96:
-        pipe.resolution = int(cfg["resolution"])
+    if not isinstance(cfg, dict):
+        cfg = {}
+    merged = dict(DEFAULT_CONFIG)
+    merged.update(cfg)
+    pipe.description = str(merged.get("description", ""))
+    resolution = merged.get("resolution")
+    if isinstance(resolution, int) and 8 <= resolution <= 96:
+        pipe.resolution = resolution
     mc = pipe.cfg
-    mc.add_perimeters = int(cfg.get("add_perimeters", mc.add_perimeters))
-    mc.max_extra_perimeters = int(cfg.get("max_extra_perimeters", mc.max_extra_perimeters))
-    mc.enable_solid_infill = bool(cfg.get("enable_solid_infill", mc.enable_solid_infill))
-    mc.enable_relax = bool(cfg.get("enable_relax", mc.enable_relax))
+    mc.add_perimeters = int(merged.get("add_perimeters", mc.add_perimeters))
+    mc.max_extra_perimeters = int(merged.get("max_extra_perimeters", mc.max_extra_perimeters))
+    mc.enable_solid_infill = bool(merged.get("enable_solid_infill", mc.enable_solid_infill))
+    mc.enable_relax = bool(merged.get("enable_relax", mc.enable_relax))
 
 
 if orca is not None:
@@ -115,30 +116,43 @@ if orca is not None:
             return None
 
     class EcoSliceCapability(orca.slicing.SlicingPipelineCapabilityBase):
+        """execute(ctx) is called for every pipeline step, so it dispatches on ctx.step."""
+
         def get_name(self) -> str:
             return PLUGIN_NAME
 
         def has_config_ui(self) -> bool:
             return False
 
-        def get_default_config(self) -> str:
-            return DEFAULT_CONFIG_JSON
+        def get_default_config(self) -> dict:
+            return dict(DEFAULT_CONFIG)
 
         def execute(self, ctx):
+            step = getattr(ctx, "step", None)
+            if step not in (_Step.posSlice, _Step.posPrepareInfill, _Step.psGCodePostProcess):
+                return _result("skipped", "step not handled by EcoSlice")
+
             pipe = get_pipeline()
             try:
                 _apply_config(pipe, self.get_config())
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("EcoSlice config unreadable (%s); using defaults", exc)
+
             try:
-                step = ctx.step
                 if step == _Step.psGCodePostProcess:
                     return self._post(ctx, pipe)
+                if ctx.cancelled():
+                    return _result("skipped", "slicing cancelled")
                 if step == _Step.posPrepareInfill:
                     pipe.on_pos_prepare_infill(ctx)
-                    return _result("success", "EcoSlice infill mutations applied")
+                    stats = pipe._last_mutation
+                    added = stats.perimeters_added if stats else 0
+                    removed = stats.perimeters_removed if stats else 0
+                    return _result(
+                        "success", f"EcoSlice: +{added} / -{removed} perimeter-lines"
+                    )
                 pipe.on_pos_slice(ctx)
-                a = pipe.analyses.get("obj0")
+                a = next(iter(pipe.analyses.values()), None)
                 msg = f"EcoSlice analyzed {len(pipe.analyses)} object(s)"
                 if a is not None:
                     msg += (f"; maxVM={a.plan.max_vm_mpa:.1f} MPa allow="
@@ -156,35 +170,31 @@ if orca is not None:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 return _result("failure", f"cannot read gcode: {exc}")
-            stats = pipe._aggregate_stats()
-            mutation = getattr(pipe, "_last_mutation", None)
-            if mutation is not None:
-                for k, v in {
-                    "perimeters_added": mutation.perimeters_added,
-                    "perimeters_removed": mutation.perimeters_removed,
-                }.items():
-                    stats.setdefault(k, v)
             out = pipe.on_gcode_postprocess(text)
-            p.write_text(out, encoding="utf-8")
+            if out == text:
+                return _result("skipped", "receipt already present")
+            try:
+                p.write_text(out, encoding="utf-8")
+            except OSError as exc:
+                return _result("failure", f"cannot write gcode: {exc}")
             return _result("success", "EcoSlice carbon receipt embedded")
-
-else:
-    EcoSliceCapability = None
-
-
-if orca is not None:
 
     @orca.plugin
     class EcoSlicePackage(orca.base):
         def register_capabilities(self) -> None:
             orca.register_capability(EcoSliceCapability)
 
+else:
+    EcoSliceCapability = None
+
 '''
 
 
-def strip_local_imports(tree: ast.Module, local_names: set[str]) -> tuple[ast.Module, list[str]]:
+def strip_local_imports(tree: ast.Module, local_names: set[str]) -> tuple[ast.Module, list[str], list[str]]:
+    """Split a module into (body, alias-rebinds, hoisted imports as (module, name, asname))."""
     keep = []
     binds: list[str] = []
+    hoisted: list[str] = []
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
             continue
@@ -201,6 +211,9 @@ def strip_local_imports(tree: ast.Module, local_names: set[str]) -> tuple[ast.Mo
             node.names = [a for a in node.names if a.name.split(".")[0] not in local_names]
             if not node.names:
                 continue
+            for a in node.names:
+                hoisted.append((node.module, a.name, a.asname))
+            continue
         elif isinstance(node, ast.Import):
             kept = [a for a in node.names if a.name.split(".")[0] not in local_names]
             for a in node.names:
@@ -209,13 +222,41 @@ def strip_local_imports(tree: ast.Module, local_names: set[str]) -> tuple[ast.Mo
             node.names = kept
             if not node.names:
                 continue
+            for a in node.names:
+                hoisted.append((None, a.name, a.asname))
+            continue
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+        ):
+            continue
         keep.append(node)
-    return ast.Module(body=keep, type_ignores=[]), binds
+    return ast.Module(body=keep, type_ignores=[]), binds, hoisted
+
+
+def render_imports(entries: list[tuple]) -> str:
+    """One deterministic import block: plain imports first, then merged from-imports."""
+    plain: list[str] = []
+    from_imports: dict[str, list[str]] = {}
+    for module, name, asname in entries:
+        rendered = name if asname is None else f"{name} as {asname}"
+        if module is None:
+            line = f"import {rendered}"
+            if line not in plain:
+                plain.append(line)
+        else:
+            names = from_imports.setdefault(module, [])
+            if rendered not in names:
+                names.append(rendered)
+    lines = plain[:]
+    for module, names in from_imports.items():
+        lines.append(f"from {module} import {', '.join(sorted(names))}")
+    return "\n".join(lines)
 
 
 def main() -> int:
     local_names = {label for _, label in MODULE_ORDER} | {"ecoslice"}
-    parts = [PEP723_HEADER, "\nfrom __future__ import annotations\n"]
+    bodies = []
+    imports: list[str] = []
     for mod, label in MODULE_ORDER:
         path = SRC / f"{mod}.py"
         if not path.exists():
@@ -223,11 +264,18 @@ def main() -> int:
             return 1
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        tree, binds = strip_local_imports(tree, local_names)
+        tree, binds, hoisted = strip_local_imports(tree, local_names)
+        for entry in hoisted:
+            if entry not in imports:
+                imports.append(entry)
         body = ast.unparse(tree)
         if binds:
             body += "\n" + "\n".join(binds)
-        parts.append(f"\n\n# {'=' * 70}\n# module: {label}\n# {'=' * 70}\n{body}")
+        bodies.append(f"\n\n# {'=' * 70}\n# module: {label}\n# {'=' * 70}\n{body}")
+
+    parts = [PEP723_HEADER, "\nfrom __future__ import annotations\n\n"]
+    parts.append(render_imports(imports) + "\n")
+    parts.extend(bodies)
     parts.append(ADAPTER)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text("".join(parts), encoding="utf-8")

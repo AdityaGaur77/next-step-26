@@ -76,7 +76,7 @@ def compare(baseline: dict, optimized: dict) -> dict:
     if dg is not None:
         out["delta_co2e_g_virgin_pla"] = round(dg * PLA_VIRGIN_KG_CO2E_PER_KG, 2)
     if dt is not None:
-        out["delta_energy_kwh_at_100w"] = round(-dt / 3600.0 * PRINTER_WATTS_DEFAULT / 1000.0, 4)
+        out["energy_saved_kwh_at_100w"] = round(-dt / 3600.0 * PRINTER_WATTS_DEFAULT / 1000.0, 4)
     return out
 
 

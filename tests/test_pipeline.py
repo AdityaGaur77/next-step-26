@@ -1,20 +1,21 @@
 import logging
 
-import numpy as np
 import pytest
 
-from ecoslice.mutate import MutationConfig, MutationStats
+from ecoslice.mutate import MutationConfig, compute_alignment
 from ecoslice.pipeline import EcoSlicePipeline
 from ecoslice.voxelize import box_mesh
 
-from mocks import cantilever_ctx
+from mocks import SurfaceType, cantilever_ctx
+
+DESC = "shelf bracket holding 8 kg, load downward; screwed onto left wall"
 
 
 @pytest.fixture(scope="module")
 def analysis():
-    pipe = EcoSlicePipeline(description="shelf bracket holding 8 kg, load downward; screwed onto left wall", resolution=40)
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
     v, t = box_mesh(100.0, 10.0, 10.0)
-    return pipe.analyze_mesh(v, t, "shelf bracket holding 8 kg, load downward; screwed onto left wall", "obj")
+    return pipe.analyze_mesh(v, t, DESC, "obj")
 
 
 def test_end_to_end_analysis(analysis):
@@ -24,63 +25,147 @@ def test_end_to_end_analysis(analysis):
     assert analysis.grid.volume_mm3 == pytest.approx(10_000.0, rel=0.01)
 
 
-def test_hooks_run_on_mock_host():
-    pipe = EcoSlicePipeline(
-        description="shelf bracket holding 8 kg, load downward; screwed onto left wall",
-        resolution=40,
-    )
+def _surface_positions(obj, bed_offset=(120.0, 90.0)):
+    ox, oy = bed_offset
+    out = []
+    for layer in obj.layers():
+        z_mid = layer.print_z - layer.height / 2
+        for region in layer.regions():
+            for surf in region.fill_surfaces.surfaces:
+                pts = surf.expolygon.contour.points
+                x_mid = (pts[0].x + pts[2].x) / 2 / 1e6 - ox
+                out.append((x_mid, z_mid, surf))
+    return out
+
+
+def test_hooks_reinforce_root_and_relax_tip():
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
     ctx, obj = cantilever_ctx()
     pipe.on_pos_slice(ctx)
-    assert "obj0" in pipe.analyses
+    assert pipe.analyses, "posSlice should have analyzed the object"
 
     pipe.on_pos_prepare_infill(ctx)
 
     reinforced = relaxed = 0
-    for layer in obj.layers:
-        z_mid = layer.print_z - layer.height / 2
-        for region in layer.regions:
-            for surf in region.fill_surfaces:
-                pts = surf.expolygon.contour.points
-                x_mid_mm = (pts[0].x + pts[2].x) / 2 / 1e6
-                if x_mid_mm < 25.0 and z_mid <= 3.0:
-                    if surf.extra_perimeters >= 3 and surf.surface_type == "internal_solid":
-                        reinforced += 1
-                elif x_mid_mm > 85.0 and 3.0 < z_mid < 7.0:
-                    if surf.extra_perimeters == 0:
-                        relaxed += 1
+    for x_mid, z_mid, surf in _surface_positions(obj):
+        if x_mid < 25.0 and z_mid <= 3.0:
+            if surf.extra_perimeters >= 3 and surf.surface_type is SurfaceType.stInternalSolid:
+                reinforced += 1
+        elif x_mid > 85.0 and 3.0 < z_mid < 7.0:
+            if surf.extra_perimeters == 0:
+                relaxed += 1
     assert reinforced > 0, "root layers should gain extra perimeters + solid infill"
     assert relaxed > 0, "low-stress tip layers should be relaxed"
 
 
-def test_postprocess_inserts_receipt():
+def test_plan_is_aligned_to_the_bed_position():
+    """Mesh arrives in object coords; slices sit at the object's bed position."""
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
+    ctx, obj = cantilever_ctx(bed_offset=(120.0, 90.0))
+    pipe.on_pos_slice(ctx)
+    analysis = next(iter(pipe.analyses.values()))
+    alignment = compute_alignment(obj, analysis.grid)
+    assert alignment.dx == pytest.approx(120.0, abs=0.5)
+    assert alignment.dy == pytest.approx(90.0, abs=0.5)
+
+    pipe.on_pos_prepare_infill(ctx)
+    root = [s for x, z, s in _surface_positions(obj) if x < 15.0 and z <= 2.0]
+    tip = [s for x, z, s in _surface_positions(obj) if x > 90.0 and z <= 2.0]
+    assert max(s.extra_perimeters for s in root) > max(s.extra_perimeters for s in tip)
+
+
+def test_unaligned_plan_would_miss_every_surface():
+    """Without alignment the plan lands off the part — the bug this guards."""
+    from ecoslice.mutate import FrameAlignment, apply_plan_to_object
+
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
+    ctx, obj = cantilever_ctx()
+    pipe.on_pos_slice(ctx)
+    analysis = next(iter(pipe.analyses.values()))
+    stats = apply_plan_to_object(
+        obj, analysis.plan, analysis.grid, pipe.cfg, FrameAlignment(0.0, 0.0, 0.0)
+    )
+    assert stats.perimeters_added == 0
+
+
+def test_legacy_duck_typed_host_still_mutates():
+    pipe = EcoSlicePipeline(description=DESC, resolution=32)
+    ctx, obj = cantilever_ctx(legacy=True, bed_offset=(0.0, 0.0))
+    pipe.on_pos_slice(ctx)
+    pipe.on_pos_prepare_infill(ctx)
+    eps = [s.extra_perimeters for layer in obj.layers for r in layer.regions for s in r.fill_surfaces]
+    assert max(eps) >= 3
+
+
+def test_postprocess_inserts_receipt_after_header():
     pipe = EcoSlicePipeline(resolution=24)
     v, t = box_mesh(60.0, 10.0, 6.0)
     pipe.analyze_mesh(v, t, "small bracket 4kg down, mounted on left wall", "obj0")
     gcode = "; generated by OrcaSlicer\nG28\n"
     out = pipe.on_gcode_postprocess(gcode)
-    assert ";ECOSLICE BEGIN" in out
-    assert ";ECOSLICE END" in out
-    assert out.index(";ECOSLICE END") < out.index("G28") or True
     lines = out.splitlines()
-    ec = [i for i, l in enumerate(lines) if l.startswith(";ECOSLICE")]
-    g28 = lines.index("G28")
-    assert max(ec) < g28 + 2
+    assert lines[0] == "; generated by OrcaSlicer"
+    assert lines[1].startswith(";ECOSLICE BEGIN")
+    assert lines.index("G28") > max(i for i, l in enumerate(lines) if l.startswith(";ECOSLICE"))
+
+
+def test_postprocess_is_idempotent():
+    """psGCodePostProcess can fire more than once per slice."""
+    pipe = EcoSlicePipeline(resolution=24)
+    v, t = box_mesh(60.0, 10.0, 6.0)
+    pipe.analyze_mesh(v, t, "small bracket 4kg down, mounted on left wall", "obj0")
+    once = pipe.on_gcode_postprocess("; generated by OrcaSlicer\nG28\n")
+    twice = pipe.on_gcode_postprocess(once)
+    assert twice.count(";ECOSLICE BEGIN") == 1
+    assert twice == once
+
+
+def test_receipt_reports_applied_mutations():
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
+    ctx, _ = cantilever_ctx()
+    pipe.on_pos_slice(ctx)
+    pipe.on_pos_prepare_infill(ctx)
+    assert pipe._last_mutation.perimeters_added > 0
+    receipt = pipe.on_gcode_postprocess("; generated by OrcaSlicer\nG28\n")
+    added = pipe._last_mutation.perimeters_added
+    removed = pipe._last_mutation.perimeters_removed
+    assert f"{added} extra perimeter-lines added" in receipt
+    assert f"{removed} perimeter-lines removed" in receipt
 
 
 def test_mutation_config_gates():
     cfg_off = MutationConfig(add_perimeters=2, enable_relax=False)
-    pipe = EcoSlicePipeline(cfg=cfg_off, description="bracket 6kg down, bolted to left wall", resolution=32)
+    pipe = EcoSlicePipeline(cfg=cfg_off, description=DESC, resolution=32)
     ctx, obj = cantilever_ctx()
     pipe.on_pos_slice(ctx)
     pipe.on_pos_prepare_infill(ctx)
-    eps = {s.extra_perimeters for layer in obj.layers for r in layer.regions for s in r.fill_surfaces}
+    eps = {s.extra_perimeters for _, _, s in _surface_positions(obj)}
     assert 0 not in eps, "relax disabled -> baseline extra_perimeters must survive"
+
+
+def test_load_face_held_by_fixture_is_moved():
+    pipe = EcoSlicePipeline(resolution=24)
+    v, t = box_mesh(60.0, 20.0, 20.0)
+    a = pipe.analyze_mesh(v, t, "shelf holding 5 kg downward, sitting on the desk", "obj0")
+    assert a.plan.max_vm_mpa > 0, "a fully constrained load face must not silently zero the solve"
+    assert any("load applied on" in n for n in a.notes)
+
+
+def test_resolution_is_capped_for_bulky_parts():
+    pipe = EcoSlicePipeline(resolution=96)
+    v, t = box_mesh(80.0, 60.0, 40.0)
+    a = pipe.analyze_mesh(v, t, "bracket 5kg down, bolted to left wall", "obj0")
+    assert int(a.grid.mask.sum()) <= 150_000
+    assert any("resolution reduced" in n for n in a.notes)
 
 
 def test_never_crashes_on_bad_ctx(caplog):
     pipe = EcoSlicePipeline(resolution=16)
+
     class BadCtx:
+        object = None
         objects = None
+
     with caplog.at_level(logging.WARNING):
         pipe.on_pos_slice(BadCtx())
         pipe.on_pos_prepare_infill(BadCtx())
@@ -92,4 +177,5 @@ def test_stats_aggregation_for_receipt():
     a = pipe.analyze_mesh(v, t, "bracket 3kg down, mounted on left wall", "obj0")
     stats = pipe._aggregate_stats()
     assert stats["max_vm_mpa"] == pytest.approx(a.plan.max_vm_mpa, abs=0.5)
-    assert "saved_vs_uniform_grams" in str(stats) or True
+    assert "saved_vs_uniform_grams" in stats
+    assert stats["load_case_source"] == a.load_case.source

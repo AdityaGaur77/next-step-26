@@ -49,7 +49,43 @@ def test_stress_concentrated_at_fixed_root(cantilever):
 
 def test_solver_reports_method(cantilever):
     _, res, _, _ = cantilever
-    assert res.solver in ("splu",) or res.solver.startswith("pyamg")
+    assert res.solver.startswith(("splu", "jacobi-cg", "pyamg"))
+    assert res.n_dof > 0
+
+
+def test_large_systems_use_an_iterative_solver():
+    """Direct LU blows up on 3D elasticity; the ladder must switch to CG."""
+    v, t = box_mesh(60.0, 40.0, 30.0)
+    grid = voxelize(v, t, resolution=24)
+    res = solve_voxel_fem(grid, ["x-"], "x+", (0.0, 0.0, -40.0))
+    assert res.n_dof > 8_000
+    assert res.solver.startswith(("jacobi-cg", "pyamg")), res.solver
+    assert res.iterations > 0
+
+
+def test_load_face_inside_the_fixture_is_rejected():
+    v, t = box_mesh(40.0, 20.0, 20.0)
+    grid = voxelize(v, t, resolution=16)
+    with pytest.raises(ValueError, match="fully constrained"):
+        solve_voxel_fem(grid, ["z-"], "z-", (0.0, 0.0, -30.0))
+
+
+def test_unsupported_part_is_rejected():
+    from ecoslice.voxelize import VoxelGrid
+
+    mask = np.zeros((6, 6, 6), bool)
+    mask[1:5, 1:5, 1:5] = True
+    grid = VoxelGrid(mask=mask, origin=np.zeros(3), spacing=(1.0, 1.0, 1.0))
+    with pytest.raises(ValueError, match="unsupported"):
+        solve_voxel_fem(grid, ["z-"], "z+", (0.0, 0.0, -10.0))
+
+
+def test_opposite_face():
+    from ecoslice.fem import opposite_face
+
+    assert opposite_face("z-") == "z+"
+    assert opposite_face("bottom") == "z+"
+    assert opposite_face("x+") == "x-"
 
 
 def test_empty_grid_raises():

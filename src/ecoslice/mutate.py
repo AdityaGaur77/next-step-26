@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-
 from .host_bridge import (
     get_extra_perimeters,
     get_fill_surfaces,
@@ -12,6 +10,7 @@ from .host_bridge import (
     is_sparse_like,
     iter_layers,
     iter_regions,
+    object_footprint_mm,
     set_extra_perimeters,
     set_surface_type,
     surface_centroid_xy_mm,
@@ -46,8 +45,47 @@ class MutationStats:
         self.perimeters_removed += other.perimeters_removed
 
 
-def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid, bbox) -> str:
-    x0, y0, _ = bbox[0]
+@dataclass(frozen=True)
+class FrameAlignment:
+    """Translation from slicer coordinates into the analysis grid's frame.
+
+    The analysed mesh and the sliced polygons need not share an origin (the
+    object is placed on the bed, and libslic3r keeps slices in the print
+    object's own frame), so the plan is anchored by matching bounding boxes
+    rather than by trusting either origin.
+    """
+
+    dx: float = 0.0
+    dy: float = 0.0
+    dz: float = 0.0
+
+    def to_grid_xy(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        return (x_mm - self.dx, y_mm - self.dy)
+
+    def to_grid_z(self, z_mm: float) -> float:
+        return z_mm - self.dz
+
+
+def compute_alignment(print_object, grid, layers=None) -> FrameAlignment:
+    dx = dy = dz = 0.0
+    footprint = object_footprint_mm(print_object)
+    if footprint is not None:
+        min_x, min_y, max_x, max_y = footprint
+        if max_x > min_x and max_y > min_y:
+            dx = min_x - float(grid.origin[0])
+            dy = min_y - float(grid.origin[1])
+
+    layers = iter_layers(print_object) if layers is None else layers
+    for layer in layers:
+        zr = get_layer_z(layer)
+        if zr is not None:
+            dz = zr[0] - float(grid.origin[2])
+            break
+    return FrameAlignment(dx=dx, dy=dy, dz=dz)
+
+
+def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid) -> str:
+    x0, y0 = float(grid.origin[0]), float(grid.origin[1])
     h = grid.h
     i = int((x_mm - x0) / h)
     j = int((y_mm - y0) / h)
@@ -61,8 +99,15 @@ def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid, bbox) -> s
     return "neutral"
 
 
-def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig) -> MutationStats:
+def apply_to_region(
+    region,
+    action: LayerAction,
+    grid,
+    cfg: MutationConfig,
+    alignment: FrameAlignment | None = None,
+) -> MutationStats:
     stats = MutationStats()
+    align = alignment or FrameAlignment()
     scale = None
     for surface in get_fill_surfaces(region):
         if scale is None:
@@ -71,7 +116,8 @@ def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig
         if xy is None:
             stats.surfaces_skipped_no_xy += 1
             continue
-        cls = _classify_xy(xy[0], xy[1], action, grid, bbox)
+        gx, gy = align.to_grid_xy(xy[0], xy[1])
+        cls = _classify_xy(gx, gy, action, grid)
 
         if cls == "reinforce":
             cur = get_extra_perimeters(surface)
@@ -92,18 +138,26 @@ def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig
     return stats
 
 
-def apply_plan_to_object(print_object, plan, grid, bbox, cfg: MutationConfig) -> MutationStats:
+def apply_plan_to_object(
+    print_object,
+    plan,
+    grid,
+    cfg: MutationConfig,
+    alignment: FrameAlignment | None = None,
+) -> MutationStats:
     total = MutationStats()
-    for layer in iter_layers(print_object):
+    layers = iter_layers(print_object)
+    align = alignment if alignment is not None else compute_alignment(print_object, grid, layers)
+    for layer in layers:
         zr = get_layer_z(layer)
         if zr is None:
             continue
-        z_mid = (zr[0] + zr[1]) * 0.5
+        z_mid = align.to_grid_z((zr[0] + zr[1]) * 0.5)
         for action in plan.actions:
-            if action.z0_mm <= z_mid <= action.z1_mm or (
-                z_mid >= action.z0_mm and z_mid < action.z1_mm
+            if action.z0_mm <= z_mid < action.z1_mm or (
+                action is plan.actions[-1] and z_mid == action.z1_mm
             ):
                 for region in iter_regions(layer):
-                    total.merge(apply_to_region(region, action, grid, bbox, cfg))
+                    total.merge(apply_to_region(region, action, grid, cfg, align))
                 break
     return total

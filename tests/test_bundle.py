@@ -44,6 +44,29 @@ def test_bundled_pipeline_end_to_end(bundled):
     assert ";ECOSLICE BEGIN" in out
 
 
+def test_default_config_is_a_valid_dict(bundled):
+    """The host requires get_default_config() to hand back an object, not a string."""
+    import json
+
+    cfg = bundled.DEFAULT_CONFIG
+    assert isinstance(cfg, dict)
+    assert isinstance(json.loads(json.dumps(cfg)), dict)
+    assert "{{" not in PLUGIN.read_text(encoding="utf-8")
+
+
+def test_config_round_trips_into_the_pipeline(bundled):
+    import json
+
+    pipe = bundled.create_pipeline()
+    bundled._apply_config(pipe, json.dumps({"resolution": 24, "add_perimeters": 3}))
+    assert pipe.resolution == 24
+    assert pipe.cfg.add_perimeters == 3
+    assert pipe.cfg.enable_relax is True
+
+    bundled._apply_config(pipe, "not json at all")
+    assert pipe.resolution == bundled.DEFAULT_CONFIG["resolution"]
+
+
 def test_no_relative_imports_in_bundle(bundled):
     src = PLUGIN.read_text(encoding="utf-8")
     for i, line in enumerate(src.splitlines(), 1):
