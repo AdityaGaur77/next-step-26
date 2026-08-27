@@ -110,6 +110,23 @@ def test_real_host_frames_mesh_on_plate_slices_local():
     assert max(s.extra_perimeters for s in root) > max(s.extra_perimeters for s in tip)
 
 
+def test_single_surface_spanning_whole_part_is_still_mutated():
+    """Real parts slice into few large surfaces: one rectangle per layer
+    spanning hot AND cold zones. Centroid-only classification reads 'neutral'
+    and mutates nothing (the second bug found on the real host) — outline
+    overlap must catch the hot end."""
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
+    ctx, obj = cantilever_ctx(segments_x=1)
+    pipe.on_pos_slice(ctx)
+    pipe.on_pos_prepare_infill(ctx)
+    assert pipe._last_mutation.perimeters_added > 0
+    positions = _surface_positions(obj)
+    root_eps = [s.extra_perimeters for x, z, s in positions if z <= 2.0]
+    tip_eps = [s.extra_perimeters for x, z, s in positions if 3.0 < z < 7.0]
+    assert max(root_eps) >= 3, "layers overlapping the hot columns must gain perimeters"
+    assert min(tip_eps) == 0, "cold layers spanning only relax columns must relax"
+
+
 def test_legacy_duck_typed_host_still_mutates():
     pipe = EcoSlicePipeline(description=DESC, resolution=32)
     ctx, obj = cantilever_ctx(legacy=True, bed_offset=(0.0, 0.0))

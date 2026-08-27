@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from .host_bridge import (
     get_extra_perimeters,
     get_fill_surfaces,
@@ -15,6 +17,7 @@ from .host_bridge import (
     set_surface_type,
     slice_bbox_mm,
     surface_centroid_xy_mm,
+    surface_outline_mm,
 )
 from .mapping import LayerAction
 
@@ -110,6 +113,51 @@ def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid) -> str:
     return "neutral"
 
 
+def _classify_outline(outline_xy, action: LayerAction, grid) -> str:
+    """Classify a surface by the mask cells its outline touches.
+
+    Real parts slice into few large surfaces (a whole layer can be ONE
+    rectangle spanning the hot and cold zones), so classifying by centroid
+    alone reads 'neutral' and skips them. Any outline point inside a
+    reinforce column wins; relax only when no hot overlap exists.
+    """
+    x0, y0 = float(grid.origin[0]), float(grid.origin[1])
+    h = grid.h
+    nx, ny = action.reinforce_xy.shape
+    i = np.floor((outline_xy[:, 0] - x0) / h).astype(int)
+    j = np.floor((outline_xy[:, 1] - y0) / h).astype(int)
+    i = np.clip(i, 0, nx - 1)
+    j = np.clip(j, 0, ny - 1)
+    inside = (
+        (outline_xy[:, 0] >= x0)
+        & (outline_xy[:, 0] < x0 + nx * h)
+        & (outline_xy[:, 1] >= y0)
+        & (outline_xy[:, 1] < y0 + ny * h)
+    )
+    if not inside.any():
+        return "outside"
+    if action.reinforce_xy[i[inside], j[inside]].any():
+        return "reinforce"
+    if action.relax_xy[i[inside], j[inside]].any():
+        return "relax"
+    return "neutral"
+
+
+def _classify_surface(surface, action: LayerAction, grid, scale, alignment: FrameAlignment) -> str:
+    outline = surface_outline_mm(surface, scale=scale)
+    if outline is not None and outline.shape[0] > 0:
+        grid_xy = np.column_stack(
+            (outline[:, 0] - alignment.dx, outline[:, 1] - alignment.dy)
+        )
+        cls = _classify_outline(grid_xy, action, grid)
+        if cls != "neutral":
+            return cls
+    xy = surface_centroid_xy_mm(surface, scale=scale)
+    if xy is None:
+        return "no_xy"
+    return _classify_xy(*alignment.to_grid_xy(xy[0], xy[1]), action, grid)
+
+
 def apply_to_region(
     region,
     action: LayerAction,
@@ -123,12 +171,10 @@ def apply_to_region(
     for surface in get_fill_surfaces(region):
         if scale is None:
             scale = guess_scale(surface)
-        xy = surface_centroid_xy_mm(surface, scale=scale)
-        if xy is None:
+        cls = _classify_surface(surface, action, grid, scale, align)
+        if cls == "no_xy":
             stats.surfaces_skipped_no_xy += 1
             continue
-        gx, gy = align.to_grid_xy(xy[0], xy[1])
-        cls = _classify_xy(gx, gy, action, grid)
 
         if cls == "reinforce":
             cur = get_extra_perimeters(surface)

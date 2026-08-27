@@ -331,6 +331,19 @@ def slice_bbox_mm(print_object, max_layers: int = 16) -> tuple | None:
     )
 
 
+def surface_outline_mm(surface, scale: float | None = None) -> np.ndarray | None:
+    """Contour points of a fill surface as (N,2) mm coordinates."""
+    contour = _contour_of(surface)
+    if contour is None:
+        return None
+    a = _contour_points_scaled(contour)
+    if a is None:
+        return None
+    if scale is None:
+        scale = guess_scale(surface)
+    return a / scale
+
+
 def surface_centroid_xy_mm(surface, scale: float | None = None) -> tuple[float, float] | None:
     contour = _contour_of(surface)
     if contour is None:
