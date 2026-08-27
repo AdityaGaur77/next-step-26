@@ -13,6 +13,7 @@ from .host_bridge import (
     object_footprint_mm,
     set_extra_perimeters,
     set_surface_type,
+    slice_bbox_mm,
     surface_centroid_xy_mm,
 )
 from .mapping import LayerAction
@@ -68,12 +69,22 @@ class FrameAlignment:
 
 def compute_alignment(print_object, grid, layers=None) -> FrameAlignment:
     dx = dy = dz = 0.0
-    footprint = object_footprint_mm(print_object)
-    if footprint is not None:
-        min_x, min_y, max_x, max_y = footprint
-        if max_x > min_x and max_y > min_y:
-            dx = min_x - float(grid.origin[0])
-            dy = min_y - float(grid.origin[1])
+    # Anchor xy on the slice polygons themselves: in OrcaSlicer the mesh comes
+    # back in plate coordinates (trafo applied) while fill_surfaces stay in the
+    # object-local frame, so footprint/grid origins alone leave the shift
+    # unknown. Matching the slice bbox onto the grid footprint works whichever
+    # frame either side is in.
+    bbox = slice_bbox_mm(print_object)
+    if bbox is not None and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+        dx = bbox[0] - float(grid.origin[0])
+        dy = bbox[1] - float(grid.origin[1])
+    else:
+        footprint = object_footprint_mm(print_object)
+        if footprint is not None:
+            min_x, min_y, max_x, max_y = footprint
+            if max_x > min_x and max_y > min_y:
+                dx = min_x - float(grid.origin[0])
+                dy = min_y - float(grid.origin[1])
 
     layers = iter_layers(print_object) if layers is None else layers
     for layer in layers:

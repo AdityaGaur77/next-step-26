@@ -260,6 +260,77 @@ def _contour_centroid_scaled(contour) -> tuple[float, float] | None:
     return (sx / count, sy / count)
 
 
+def _contour_points_scaled(contour) -> np.ndarray | None:
+    arr = _call_or_attr(contour, "as_array")
+    if arr is not None:
+        a = np.asarray(arr, dtype=np.float64)
+        if a.ndim == 2 and a.shape[1] == 2 and a.shape[0] > 0:
+            return a
+    pts = _first_attr(contour, ("points", "pts"))
+    if pts is None:
+        return None
+    rows = []
+    for p in pts:
+        x = getattr(p, "x", None)
+        y = getattr(p, "y", None)
+        if x is None:
+            try:
+                x, y = p[0], p[1]
+            except Exception:
+                continue
+        rows.append((float(x), float(y)))
+    if not rows:
+        return None
+    return np.asarray(rows, dtype=np.float64)
+
+
+def slice_bbox_mm(print_object, max_layers: int = 16) -> tuple | None:
+    """Bounding box of the sliced fill polygons, in mm, in the frame the host
+    keeps layer geometry in.
+
+    OrcaSlicer keeps fill_surfaces in the object-local frame while the mesh
+    (after `trafo()`) sits in the plate frame; this bbox is the ground truth
+    for anchoring the analysis grid onto the slices regardless of either
+    frame's origin.
+    """
+    min_pt = None
+    max_pt = None
+    layers_with_points = 0
+    for layer in iter_layers(print_object):
+        if layers_with_points >= max_layers:
+            break
+        lo = hi = None
+        for region in iter_regions(layer):
+            for surface in get_fill_surfaces(region):
+                contour = _contour_of(surface)
+                if contour is None:
+                    continue
+                a = _contour_points_scaled(contour)
+                if a is None:
+                    continue
+                lo = a.min(axis=0) if lo is None else np.minimum(lo, a.min(axis=0))
+                hi = a.max(axis=0) if hi is None else np.maximum(hi, a.max(axis=0))
+        if lo is None or hi is None:
+            continue
+        layers_with_points += 1
+        min_pt = lo if min_pt is None else np.minimum(min_pt, lo)
+        max_pt = hi if max_pt is None else np.maximum(max_pt, hi)
+    if min_pt is None or max_pt is None:
+        return None
+    extent = float(((max_pt - min_pt) ** 2).sum() ** 0.5)
+    scale = SCALED_UNITS_PER_MM
+    for s in SCALE_GUESSES:
+        if 1e-2 < extent / s < 1e5:
+            scale = s
+            break
+    return (
+        float(min_pt[0]) / scale,
+        float(min_pt[1]) / scale,
+        float(max_pt[0]) / scale,
+        float(max_pt[1]) / scale,
+    )
+
+
 def surface_centroid_xy_mm(surface, scale: float | None = None) -> tuple[float, float] | None:
     contour = _contour_of(surface)
     if contour is None:

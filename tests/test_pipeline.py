@@ -88,6 +88,28 @@ def test_unaligned_plan_would_miss_every_surface():
     assert stats.perimeters_added == 0
 
 
+def test_real_host_frames_mesh_on_plate_slices_local():
+    """The real OrcaSlicer split observed on the nightly: get_mesh() comes back
+    in plate coordinates (trafo applied) while fill_surfaces stay in the
+    object-local frame. Alignment must anchor on the slice bbox, or every
+    surface classifies as 'outside' and nothing is mutated (receipt says
+    reinforced N layers, 0 perimeter-lines added)."""
+    pipe = EcoSlicePipeline(description=DESC, resolution=40)
+    ctx, obj = cantilever_ctx(bed_offset=(120.0, 90.0), slices_frame="local")
+    pipe.on_pos_slice(ctx)
+    analysis = next(iter(pipe.analyses.values()))
+    alignment = compute_alignment(obj, analysis.grid)
+    assert alignment.dx == pytest.approx(-120.0, abs=0.5)
+    assert alignment.dy == pytest.approx(-90.0, abs=0.5)
+
+    pipe.on_pos_prepare_infill(ctx)
+    assert pipe._last_mutation.perimeters_added > 0, "plan must actually land on local-frame surfaces"
+    positions = _surface_positions(obj, bed_offset=(0.0, 0.0))
+    root = [s for x, z, s in positions if x < 15.0 and z <= 2.0]
+    tip = [s for x, z, s in positions if x > 90.0 and z <= 2.0]
+    assert max(s.extra_perimeters for s in root) > max(s.extra_perimeters for s in tip)
+
+
 def test_legacy_duck_typed_host_still_mutates():
     pipe = EcoSlicePipeline(description=DESC, resolution=32)
     ctx, obj = cantilever_ctx(legacy=True, bed_offset=(0.0, 0.0))

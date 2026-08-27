@@ -90,15 +90,17 @@ previously obtained references. Do not stash references or numpy views across ca
 with `vertices()` (N,3 float32) / `triangles()` (M,3 int32), plus `volume()`, `bounding_box()`,
 `is_manifold()`. Meshes are immutable copy-on-write snapshots.
 
-⚠️ **Frames.** `TriangleMesh` is in the volume's *local, untransformed* mm frame. Getting to the
-frame the sliced polygons live in takes `ModelVolume.matrix()` (volume→object) and then
-`PrintObject.trafo()` (object→print). `PrintObject.bounding_box()` returns the object's XY
-bbox in scaled coords and the source states *"the sliced polygons live in this same frame"* —
-so EcoSlice anchors its analysis grid by matching that bounding box rather than trusting any
-single origin (`ecoslice.mutate.compute_alignment`).
+⚠️ **Frames (RUNTIME OBSERVATION 2026-08-26 overrides the source comment).** After applying
+`ModelVolume.matrix()` and `PrintObject.trafo()`, the mesh and `PrintObject.bounding_box()` are
+in **plate coordinates**, but `fill_surfaces` polygons stay in the **object-local frame**
+(observed: surface centroid ≈ (0,0) while the same cube sat at X≈57–163 on the plate; the source
+comment claims both share a frame — they do not on the pinned nightly). The plan therefore
+anchors on the **slice polygon bbox itself** (`host_bridge.slice_bbox_mm`) mapped onto the grid
+footprint — correct whichever frame either side is in. The buggy variant (anchoring footprint
+vs. grid origin only) classifies every surface as "outside": plan says reinforced N layers,
+**0 perimeter-lines applied**.
 
-## Still to confirm at runtime (spike)
-1. That an `extra_perimeters` / `surface_type` write at `posPrepareInfill` visibly changes the
-   exported G-code on the pinned nightly.
-2. Whether `ctx.object` is populated at `posPrepareInfill` for every object (we handle both).
+## Confirmed at runtime (spike, 2026-08-26 nightly 2.5.0-dev)
+1. `extra_perimeters` / `surface_type` writes at `posPrepareInfill` change the exported G-code. GO.
+2. `ctx.object` is populated at `posPrepareInfill` (single-object prints; multi-object untested).
 3. Config-UI HTML plumbing (`window.orca.saveConfig`) — untested, `has_config_ui()` is False.

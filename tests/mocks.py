@@ -284,8 +284,16 @@ def cantilever_ctx(
     segments_x=10,
     bed_offset=(120.0, 90.0),
     legacy=False,
+    slices_frame="bed",
 ):
-    """A cantilever sliced on a bed, mesh in local coords and slices offset by `bed_offset`."""
+    """A cantilever sliced on a bed.
+
+    slices_frame="bed": mesh in local coords, slices offset by `bed_offset`
+    (the legacy assumption).
+    slices_frame="local": the real OrcaSlicer split — `get_mesh()` applies the
+    PrintObject trafo (mesh in plate coords) while fill_surfaces stay in the
+    object-local frame.
+    """
     from ecoslice.voxelize import box_mesh
 
     v, t = box_mesh(length_mm, width_mm, height_mm)
@@ -297,12 +305,13 @@ def cantilever_ctx(
     region_cls = LegacyRegion if legacy else LayerRegion
     layer_cls = LegacyLayer if legacy else Layer
 
+    s_off = (ox, oy) if slices_frame == "bed" else (0.0, 0.0)
     layers = []
     for i in range(n_layers):
         pz = (i + 1) * layer_h
         surfaces = [
             surface_cls(
-                rect_pts(ox + s * seg_w, oy, ox + (s + 1) * seg_w, oy + width_mm),
+                rect_pts(s_off[0] + s * seg_w, s_off[1], s_off[0] + (s + 1) * seg_w, s_off[1] + width_mm),
                 extra_perimeters=baseline_extra_perimeters,
             )
             for s in range(segments_x)
@@ -314,9 +323,15 @@ def cantilever_ctx(
         return LegacyCtx([obj]), obj
 
     volume = ModelVolume(TriangleMesh(v, t))
+    trafo = None
+    if slices_frame == "local":
+        trafo = np.eye(4)
+        trafo[0, 3] = ox
+        trafo[1, 3] = oy
     obj = PrintObject(
         ModelObject([volume]),
         layers,
+        trafo=trafo,
         footprint_mm=(ox, oy, ox + length_mm, oy + width_mm),
     )
     return Ctx([obj], config={"layer_height": layer_h}), obj
