@@ -18,29 +18,36 @@ def cantilever_mesh():
 
 
 def bracket_with_hole():
-    v, t = uv_sphere_mesh(radius=4.0, segments=16, rings=8, center=(50.0, 5.0, 5.0))
-    vb, tb = box_mesh(100.0, 10.0, 10.0)
+    """Box with a spherical cavity: nested closed shells read as a hole under parity fill."""
     import numpy as np
 
-    return np.vstack([vb, v]), np.vstack([tb, tb.max() + 1 + t])
+    vb, tb = box_mesh(120.0, 20.0, 8.0)
+    vs, ts = uv_sphere_mesh(radius=3.0, segments=20, rings=10, center=(85.0, 10.0, 4.0))
+    return np.vstack([vb, vs]), np.vstack([tb, ts + len(vb)])
+
+
+PART_BUILDERS = {
+    "cantilever": cantilever_mesh,
+    "bracket": bracket_with_hole,
+}
 
 
 DESCRIPTIONS = {
     "cantilever": "shelf bracket holding 8 kg, load downward at the front edge; screwed onto left wall",
-    "bracket": "mounting bracket for a 3 kg camera; pulls downward; bolted to right wall; safety factor 2.5",
+    "bracket": "monitor-arm bracket carrying 12 kg downward at the free end; bolted to right wall; safety factor 2.5",
 }
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="EcoSlice offline demo: FEM-driven walls/infill on synthetic parts.")
-    ap.add_argument("--part", choices=list(DESCRIPTIONS), default="cantilever")
+    ap.add_argument("--part", choices=list(PART_BUILDERS), default="cantilever")
     ap.add_argument("--resolution", type=int, default=48)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
     desc = DESCRIPTIONS[args.part]
     pipe = EcoSlicePipeline(description=desc, resolution=args.resolution, layer_height_mm=0.2)
-    v, t = cantilever_mesh()
+    v, t = PART_BUILDERS[args.part]()
     analysis = pipe.analyze_mesh(v, t, desc, "demo")
 
     if args.json:

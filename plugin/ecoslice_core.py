@@ -14,19 +14,28 @@
 
 from __future__ import annotations
 
+import numpy as np
+import inspect
+import warnings
+import scipy.sparse as sp
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from scipy.sparse.linalg import LinearOperator, cg, splu
+from typing import Optional
+
 
 # ======================================================================
 # module: __version__
 # ======================================================================
 __version__ = '0.1.0'
-__all__ = ['voxelize', 'fem', 'loadcase', 'mapping', 'host_bridge', 'mutate', 'receipt', 'pipeline']
 
 # ======================================================================
 # module: voxelize
 # ======================================================================
-from dataclasses import dataclass
-import numpy as np
-
 @dataclass(frozen=True)
 class VoxelGrid:
     mask: np.ndarray
@@ -70,8 +79,15 @@ def _triangle_hit_xs(tri2d: np.ndarray, tri_x: np.ndarray, p: np.ndarray) -> np.
     lam2 = 1.0 - lam0 - lam1
     xa, xb, xc = (tri_x[:, 0], tri_x[:, 1], tri_x[:, 2])
     return lam0 * xa[inside] + lam1 * xb[inside] + lam2 * xc[inside]
+MIN_CELLS_ACROSS_THINNEST = 4
 
-def voxelize(vertices: np.ndarray, triangles: np.ndarray, resolution: int=32) -> VoxelGrid:
+def voxelize(vertices: np.ndarray, triangles: np.ndarray, resolution: int=32, min_cells_across: int=MIN_CELLS_ACROSS_THINNEST) -> VoxelGrid:
+    """Solid voxelization by ray parity along +x.
+
+    Cell size is driven by the longest axis, but never coarser than
+    `min_cells_across` cells through the thinnest one: a plate or bracket with
+    two elements through its thickness cannot represent bending at all.
+    """
     v = np.asarray(vertices, dtype=np.float64)
     t = np.asarray(triangles, dtype=np.int64)
     if v.ndim != 2 or v.shape[1] != 3:
@@ -81,13 +97,14 @@ def voxelize(vertices: np.ndarray, triangles: np.ndarray, resolution: int=32) ->
     mn, mx = (v.min(axis=0), v.max(axis=0))
     ext = np.maximum(mx - mn, 1e-09)
     h = float(ext.max()) / float(resolution)
+    if min_cells_across > 0:
+        h = min(h, float(ext.min()) / float(min_cells_across))
     n = np.maximum(np.ceil(ext / h).astype(np.int64), 1)
     tri = v[t]
     tri_yz = tri[:, :, 1:3]
     tri_x = tri[:, :, 0]
     cy = mn[1] + (np.arange(n[1]) + 0.5) * h
     cz = mn[2] + (np.arange(n[2]) + 0.5) * h
-    cx_lo = mn[0]
     cx_centers = mn[0] + (np.arange(n[0]) + 0.5) * h
     mask = np.zeros(tuple((int(x) for x in n)), dtype=bool)
     tol = max(1e-09, h * 1e-09)
@@ -160,25 +177,28 @@ def uv_sphere_mesh(radius: float, segments: int=24, rings: int=12, center=(0.0, 
 # ======================================================================
 # module: fem
 # ======================================================================
-import warnings
-from dataclasses import dataclass, field
-import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.linalg import splu
 try:
     import pyamg
     HAS_PYAMG = True
 except ImportError:
     HAS_PYAMG = False
+_CG_TOL_KW = 'rtol' if 'rtol' in inspect.signature(cg).parameters else 'tol'
 NODE_ORDER = [(dx, dy, dz) for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
 FACES = {'x+': 0, 'x-': 0, 'y+': 1, 'y-': 1, 'z+': 2, 'z-': 2}
 FACE_ALIASES = {'right': 'x+', 'left': 'x-', 'back': 'y+', 'front': 'y-', 'top': 'z+', 'bottom': 'z-'}
+DIRECT_SOLVE_MAX_DOF = 8000
+CG_MAX_ITER = 5000
+CG_RTOL = 1e-08
 
 def canonical_face(face: str) -> str:
     f = FACE_ALIASES.get(str(face).strip().lower(), str(face).strip().lower())
     if f not in FACES:
         raise ValueError(f'unknown face {face!r}; expected one of {sorted(FACES)} or {sorted(FACE_ALIASES)}')
     return f
+
+def opposite_face(face: str) -> str:
+    f = canonical_face(face)
+    return f[0] + ('-' if f.endswith('+') else '+')
 
 def _isotropic_D(E: float, nu: float) -> np.ndarray:
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
@@ -194,7 +214,6 @@ def _hex8_ke(h: float, E: float, nu: float) -> tuple[np.ndarray, list[np.ndarray
     D = _isotropic_D(E, nu)
     Ke = np.zeros((24, 24))
     B_list = []
-    coords = np.array(NODE_ORDER, dtype=np.float64)
     for xi in (-g, g):
         for eta in (-g, g):
             for zeta in (-g, g):
@@ -230,6 +249,8 @@ class FemResult:
     max_displacement_mm: float
     solver: str
     face_displacement: dict = field(default_factory=dict)
+    n_dof: int = 0
+    iterations: int = 0
 
 def _face_nodes(grid, node_grid_shape, face: str, avoid_faces=(), patch: str='full'):
     f = canonical_face(face)
@@ -259,7 +280,59 @@ def _face_nodes(grid, node_grid_shape, face: str, avoid_faces=(), patch: str='fu
                 nodes = nodes[far]
     return nodes
 
-def solve_voxel_fem(grid, fixed_faces, load_face, load_vector_n, young_modulus_mpa: float=2400.0, poisson: float=0.3, solver_max_dof_amg: int=400000, load_patch: str='far'):
+def _active_positions(active_nodes: np.ndarray, flat_ids: np.ndarray) -> np.ndarray:
+    if active_nodes.size == 0 or flat_ids.size == 0:
+        return np.empty(0, dtype=np.int64)
+    pos = np.clip(np.searchsorted(active_nodes, flat_ids), 0, active_nodes.size - 1)
+    return pos[active_nodes[pos] == flat_ids]
+
+def _assemble_free(dof_map: np.ndarray, Ke: np.ndarray, free_index: np.ndarray, n_free: int):
+    rows, cols, vals = ([], [], [])
+    ke_flat = Ke.ravel()
+    ne = dof_map.shape[0]
+    chunk = 4096
+    for s in range(0, ne, chunk):
+        dm = free_index[dof_map[s:s + chunk]]
+        m = dm.shape[0]
+        r = np.repeat(dm, 24, axis=1).ravel()
+        c = np.tile(dm, (1, 24)).ravel()
+        keep = (r >= 0) & (c >= 0)
+        if not keep.any():
+            continue
+        rows.append(r[keep].astype(np.int32))
+        cols.append(c[keep].astype(np.int32))
+        vals.append(np.tile(ke_flat, m)[keep])
+    if not rows:
+        raise ValueError('no free degrees of freedom left after applying constraints')
+    return sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n_free, n_free)).tocsr()
+
+def _solve_linear_system(K: sp.spmatrix, f: np.ndarray) -> tuple[np.ndarray, str, int]:
+    n = f.size
+    if n <= DIRECT_SOLVE_MAX_DOF:
+        return (splu(K.tocsc()).solve(f), 'splu', 0)
+    diag = K.diagonal()
+    diag = np.where(np.abs(diag) > 0, diag, 1.0)
+    jacobi = LinearOperator(K.shape, matvec=lambda x: x / diag)
+    iters = 0
+
+    def _count(_xk):
+        nonlocal iters
+        iters += 1
+    u, info = cg(K, f, M=jacobi, maxiter=CG_MAX_ITER, callback=_count, **{_CG_TOL_KW: CG_RTOL})
+    if info == 0:
+        return (u, f'jacobi-cg({iters}it)', iters)
+    if HAS_PYAMG:
+        try:
+            ml = pyamg.smoothed_aggregation_solver(K)
+            residuals: list[float] = []
+            u = ml.solve(f, tol=CG_RTOL, accel='cg', residuals=residuals)
+            return (u, f'pyamg-cg({len(ml.levels)}lv,{max(len(residuals) - 1, 0)}it)', len(residuals))
+        except Exception as exc:
+            warnings.warn(f'pyamg path failed ({exc}); falling back to direct solve')
+    warnings.warn(f'CG did not converge (info={info}); falling back to direct solve — this may be slow')
+    return (splu(K.tocsc()).solve(f), 'splu-fallback', iters)
+
+def solve_voxel_fem(grid, fixed_faces, load_face, load_vector_n, young_modulus_mpa: float=2400.0, poisson: float=0.3, load_patch: str='far'):
     mask = grid.mask
     nx, ny, nz = mask.shape
     h = grid.h
@@ -273,65 +346,34 @@ def solve_voxel_fem(grid, fixed_faces, load_face, load_vector_n, young_modulus_m
     for a, (dx, dy, dz) in enumerate(NODE_ORDER):
         conn_global[:, a] = nid[elems[:, 0] + dx, elems[:, 1] + dy, elems[:, 2] + dz]
     active_nodes, active_inv = np.unique(conn_global, return_inverse=True)
-    conn_local_to_active = active_inv.reshape(ne, 8)
+    conn_local = active_inv.reshape(ne, 8)
     n_active = active_nodes.shape[0]
     ndof_full = n_active * 3
-    dof_map = (conn_local_to_active * 3)[:, :, None] + np.arange(3)[None, None, :]
-    dof_map = dof_map.reshape(ne, 24)
-    fixed_nodes = set()
+    dof_map = ((conn_local * 3)[:, :, None] + np.arange(3)[None, None, :]).reshape(ne, 24)
+    fixed_mask = np.zeros(n_active, dtype=bool)
     for face in fixed_faces:
         fn = _face_nodes(grid, node_grid, face)
         flat = nid[fn[:, 0], fn[:, 1], fn[:, 2]]
-        pos_in_active = np.searchsorted(active_nodes, flat)
-        pos_in_active = np.clip(pos_in_active, 0, n_active - 1)
-        hit = active_nodes[pos_in_active] == flat
-        fixed_nodes.update(pos_in_active[hit].tolist())
-    fixed_mask = np.zeros(n_active, dtype=bool)
-    fixed_mask[np.fromiter(fixed_nodes, dtype=np.int64)] = True
-    free = np.flatnonzero(~fixed_mask)
-    if free.size == 0:
-        raise ValueError('all nodes constrained')
-    free_dofs = (free[:, None] * 3 + np.arange(3)).ravel()
-    force_full = np.zeros((n_active, 3))
+        fixed_mask[_active_positions(active_nodes, flat)] = True
+    if not fixed_mask.any():
+        raise ValueError(f'constraint faces {list(fixed_faces)} touch no material — the part is unsupported')
     ln = _face_nodes(grid, node_grid, load_face, avoid_faces=fixed_faces, patch=load_patch)
     lflat = nid[ln[:, 0], ln[:, 1], ln[:, 2]]
-    lpos = np.clip(np.searchsorted(active_nodes, lflat), 0, n_active - 1)
-    lhit = active_nodes[lpos] == lflat
-    lpos = lpos[lhit]
+    lpos = _active_positions(active_nodes, lflat)
     if lpos.size == 0:
-        raise ValueError('load face has no active nodes')
+        raise ValueError(f'load face {load_face!r} touches no material')
+    if fixed_mask[lpos].all():
+        raise ValueError(f'load face {load_face!r} is fully constrained by {list(fixed_faces)} — the load would be carried straight into the fixture (no stress to solve for)')
+    free = np.flatnonzero(~fixed_mask)
+    free_dofs = (free[:, None] * 3 + np.arange(3)).ravel()
+    free_index = np.full(ndof_full, -1, dtype=np.int64)
+    free_index[free_dofs] = np.arange(free_dofs.size)
+    force_full = np.zeros((n_active, 3))
     force_full[lpos] = np.asarray(load_vector_n, dtype=np.float64) / lpos.size
     f_free = force_full.reshape(-1)[free_dofs]
     Ke, B_list = _hex8_ke(h, young_modulus_mpa, poisson)
-    rows, cols, vals = ([], [], [])
-    chunk = 4096
-    for s in range(0, ne, chunk):
-        dm = dof_map[s:s + chunk]
-        m = dm.shape[0]
-        r = np.repeat(dm, 24, axis=1).ravel()
-        c = np.tile(dm, (1, 24)).ravel()
-        v = np.tile(Ke.ravel(), m)
-        rows.append(r)
-        cols.append(c)
-        vals.append(v)
-    K = sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(ndof_full, ndof_full)).tocsr()
-    K_ff = K[free_dofs][:, free_dofs].tocsc()
-    K_ff = (K_ff + K_ff.T) * 0.5
-    used_solver = 'splu'
-    if free_dofs.size > solver_max_dof_amg and HAS_PYAMG:
-        try:
-            ml = pyamg.smoothed_aggregation_solver(K_ff.tocsr())
-            op = ml.aspreconditioner(cycle='V')
-            from scipy.sparse.linalg import cg
-            u_f, info = cg(K_ff, f_free, M=op, rtol=1e-06, maxiter=500)
-            if info != 0:
-                raise RuntimeError(f'cg info={info}')
-            used_solver = f'pyamg-cg({ml.levels}lv)'
-        except Exception as exc:
-            warnings.warn(f'pyamg path failed ({exc}); falling back to splu')
-            u_f = splu(K_ff).solve(f_free)
-    else:
-        u_f = splu(K_ff).solve(f_free)
+    K = _assemble_free(dof_map, Ke, free_index, free_dofs.size)
+    u_f, used_solver, iters = _solve_linear_system(K, f_free)
     u_full = np.zeros(ndof_full)
     u_full[free_dofs] = u_f
     D = _isotropic_D(young_modulus_mpa, poisson)
@@ -345,13 +387,12 @@ def solve_voxel_fem(grid, fixed_faces, load_face, load_vector_n, young_modulus_m
     vm = np.sqrt(vm / len(B_list))
     vm_grid = np.zeros(mask.shape)
     vm_grid[elems[:, 0], elems[:, 1], elems[:, 2]] = vm
-    disp_out = {}
     u_vec = u_full.reshape(-1, 3)
     dirn = np.asarray(load_vector_n, dtype=np.float64)
-    dirn = dirn / np.linalg.norm(dirn)
-    disp = u_vec[lpos] @ dirn
-    disp_out[canonical_face(load_face)] = float(np.mean(disp))
-    return FemResult(von_mises=vm_grid, max_displacement_mm=float(np.abs(u_vec).max()), solver=used_solver, face_displacement=disp_out)
+    norm = np.linalg.norm(dirn)
+    dirn = dirn / norm if norm > 0 else np.array([0.0, 0.0, -1.0])
+    disp_out = {canonical_face(load_face): float(np.mean(u_vec[lpos] @ dirn))}
+    return FemResult(von_mises=vm_grid, max_displacement_mm=float(np.abs(u_vec).max()), solver=used_solver, face_displacement=disp_out, n_dof=int(free_dofs.size), iterations=iters)
 
 def cantilever_reference(L: float, b: float, hh: float, P: float, E: float) -> tuple[float, float]:
     I = b * hh ** 3 / 12.0
@@ -362,12 +403,7 @@ def cantilever_reference(L: float, b: float, hh: float, P: float, E: float) -> t
 # ======================================================================
 # module: loadcase
 # ======================================================================
-import json
-import os
-import re
-from dataclasses import asdict, dataclass, field
-from typing import Optional
-import numpy as np
+log = logging.getLogger('ecoslice.loadcase')
 
 @dataclass
 class Force:
@@ -474,7 +510,6 @@ def parse_description(text: str) -> LoadCase:
     desc = text.strip()
     forces: list[Force] = []
     constraints: dict[str, Constraint] = {}
-    attach_zone = None
     m_attach = _ATTACH_RE.search(desc)
     tail = desc[m_attach.start():] if m_attach else desc
     for pat, face in _FACE_PATTERNS:
@@ -519,22 +554,36 @@ def parse_description(text: str) -> LoadCase:
     lc.validate()
     return lc
 _LLM_PROMPT = 'You convert natural-language descriptions of a mechanical part\'s job into a strict JSON load case for FEA.\n\nSchema:\n{\n  "description": string,\n  "forces": [{"direction": [x,y,z] unit-ish vector, "magnitude_n": number>0, "face": one of "x+","x-","y+","y-","z+","z-"}],\n  "constraints": [{"face": same enum}],\n  "safety_factor": number in [1,10],\n  "young_modulus_mpa": number, "poisson": number, "yield_mpa": number\n}\nFrame: x right, y back (depth), z up. Gravity pulls -z.\nConvert masses to newtons (kg -> *9.81). Faces describe where loads attach / where the part is held.\n\nPart description:\n'
+DEFAULT_MODEL = 'claude-opus-5'
 
-def llm_parse_description(text: str, model: str='claude-sonnet-4-20250514') -> Optional[LoadCase]:
+def llm_parse_description(text: str, model: str | None=None) -> Optional[LoadCase]:
+    """Structured load case via the Messages API.
+
+    Raw HTTP on purpose: the plugin runs inside OrcaSlicer's embedded interpreter,
+    where every PEP 723 dependency is installed by the host at load time, so the
+    Anthropic SDK is not available and stdlib urllib is the only transport.
+    Any failure returns None and the deterministic parser takes over.
+    """
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
         return None
+    model = model or os.environ.get('ECOSLICE_MODEL') or DEFAULT_MODEL
     try:
         import urllib.request
-        body = json.dumps({'model': model, 'max_tokens': 700, 'messages': [{'role': 'user', 'content': _LLM_PROMPT + text}]}).encode()
+        body = json.dumps({'model': model, 'max_tokens': 2048, 'output_config': {'effort': 'low'}, 'messages': [{'role': 'user', 'content': _LLM_PROMPT + text}]}).encode()
         req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, headers={'content-type': 'application/json', 'x-api-key': api_key, 'anthropic-version': '2023-06-01'})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
-        content = ''.join((b.get('text', '') for b in data.get('content', [])))
+        if data.get('stop_reason') == 'refusal':
+            log.warning('load-case extraction refused by the model; using the heuristic parser')
+            return None
+        content = ''.join((b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text'))
         lc = LoadCase.from_json(content)
         lc.description = text.strip()
+        lc.source = f'llm:{model}'
         return lc
-    except Exception:
+    except Exception as exc:
+        log.info('LLM load-case extraction unavailable (%s); using the heuristic parser', exc)
         return None
 
 def extract_load_case(text: str, prefer_llm: bool=True) -> LoadCase:
@@ -547,9 +596,6 @@ def extract_load_case(text: str, prefer_llm: bool=True) -> LoadCase:
 # ======================================================================
 # module: mapping
 # ======================================================================
-from dataclasses import dataclass, field
-import numpy as np
-
 @dataclass
 class LayerAction:
     z0_mm: float
@@ -651,10 +697,10 @@ def plan_summary_table(plan: Plan, max_rows: int=12) -> str:
 # ======================================================================
 # module: host_bridge
 # ======================================================================
-import logging
-from dataclasses import dataclass, field
 log = logging.getLogger('ecoslice.host')
+SCALED_UNITS_PER_MM = 1000000.0
 SCALE_GUESSES = (1000000.0, 1000.0, 1.0)
+SOLID_ENUM_NAMES = ('stInternalSolid', 'stSolid', 'InternalSolid')
 SOLID_TYPE_NAMES = ('internal_solid', 'internalsolid', 'solid', 'stinternalsolid')
 SPARSE_HINTS = ('internal', 'sparse', 'infill')
 
@@ -673,7 +719,8 @@ def _call_or_attr(obj, name, default=None):
     if callable(v):
         try:
             return v()
-        except Exception:
+        except Exception as exc:
+            log.debug('calling %s() failed: %s', name, exc)
             return default
     return v
 
@@ -688,7 +735,13 @@ class HostCapabilities:
     def as_dict(self) -> dict:
         return {'mesh_source': self.mesh_source, 'surface_type_mode': self.surface_type_mode, 'extra_perimeters_mode': self.extra_perimeters_mode, 'fill_surfaces_mode': self.fill_surfaces_mode, 'notes': list(self.notes)}
 
+def current_object(ctx):
+    return getattr(ctx, 'object', None)
+
 def iter_print_objects(ctx) -> list:
+    obj = current_object(ctx)
+    if obj is not None:
+        return [obj]
     for attr in ('objects', 'print_objects', 'model_objects'):
         objs = _call_or_attr(ctx, attr)
         if objs:
@@ -700,24 +753,86 @@ def iter_print_objects(ctx) -> list:
             return list(objs)
     return []
 
-def get_mesh(obj) -> tuple | None:
-    for target in (obj, _first_attr(obj, ('mesh', 'model_object', 'volume', 'volumes'))):
-        if target is None:
-            continue
-        verts = None
-        tris = None
-        for name in ('vertices', 'its_vertices', 'get_vertices'):
-            verts = _call_or_attr(target, name)
-            if verts is not None:
-                break
-        for name in ('triangles', 'indices', 'its_indices', 'get_triangles'):
-            tris = _call_or_attr(target, name)
-            if tris is not None:
-                break
-        if verts is not None and tris is not None:
-            import numpy as np
-            return (np.asarray(verts, dtype=np.float32), np.asarray(tris, dtype=np.int32))
-    return None
+def object_key(obj) -> str:
+    oid = _call_or_attr(obj, 'id')
+    if isinstance(oid, (int, str)):
+        return f'obj{oid}'
+    return f'obj@{id(obj):x}'
+
+def _apply_affine(verts: np.ndarray, matrix) -> np.ndarray:
+    if matrix is None:
+        return verts
+    m = np.asarray(matrix, dtype=np.float64)
+    if m.shape != (4, 4):
+        return verts
+    return verts @ m[:3, :3].T + m[:3, 3]
+
+def _mesh_arrays(mesh) -> tuple | None:
+    verts = _call_or_attr(mesh, 'vertices')
+    tris = _call_or_attr(mesh, 'triangles')
+    if tris is None:
+        tris = _call_or_attr(mesh, 'indices')
+    if verts is None or tris is None:
+        return None
+    v = np.array(verts, dtype=np.float64, copy=True)
+    t = np.array(tris, dtype=np.int64, copy=True)
+    if v.ndim != 2 or v.shape[1] != 3 or t.ndim != 2 or (t.shape[1] != 3):
+        return None
+    return (v, t)
+
+def get_mesh(print_object) -> tuple | None:
+    """Mesh of a PrintObject in print coordinates (mm).
+
+    OrcaSlicer hands out per-volume meshes in the volume's own local frame
+    (PluginHostMesh.cpp), so volume->object (`ModelVolume.matrix()`) and
+    object->print (`PrintObject.trafo()`) have to be applied before the geometry
+    lines up with the sliced layers.
+    """
+    trafo = _call_or_attr(print_object, 'trafo')
+    model_object = _call_or_attr(print_object, 'model_object')
+    parts: list[tuple[np.ndarray, np.ndarray]] = []
+    if model_object is not None:
+        volumes = _call_or_attr(model_object, 'volumes') or []
+        for vol in volumes:
+            is_part = _call_or_attr(vol, 'is_model_part')
+            if is_part is False:
+                continue
+            mesh = _call_or_attr(vol, 'mesh')
+            arrays = _mesh_arrays(mesh) if mesh is not None else None
+            if arrays is None:
+                continue
+            v, t = arrays
+            parts.append((_apply_affine(v, _call_or_attr(vol, 'matrix')), t))
+    if not parts:
+        arrays = _mesh_arrays(print_object)
+        if arrays is None:
+            mesh = _first_attr(print_object, ('mesh', 'raw_mesh'))
+            arrays = _mesh_arrays(mesh) if mesh is not None else None
+        if arrays is None:
+            return None
+        parts.append(arrays)
+    verts = []
+    tris = []
+    offset = 0
+    for v, t in parts:
+        verts.append(v)
+        tris.append(t + offset)
+        offset += v.shape[0]
+    v_all = _apply_affine(np.vstack(verts), trafo)
+    return (v_all.astype(np.float32), np.vstack(tris).astype(np.int32))
+
+def object_footprint_mm(print_object) -> tuple | None:
+    bb = _call_or_attr(print_object, 'bounding_box')
+    if bb is None:
+        return None
+    try:
+        values = [float(x) for x in bb]
+    except TypeError:
+        return None
+    if len(values) != 4:
+        return None
+    min_x, min_y, max_x, max_y = values
+    return (min_x / SCALED_UNITS_PER_MM, min_y / SCALED_UNITS_PER_MM, max_x / SCALED_UNITS_PER_MM, max_y / SCALED_UNITS_PER_MM)
 
 def iter_layers(print_object) -> list:
     layers = _call_or_attr(print_object, 'layers')
@@ -732,13 +847,24 @@ def iter_regions(layer) -> list:
     return []
 
 def get_fill_surfaces(region) -> list:
-    fs = _call_or_attr(region, 'fill_surfaces')
+    """Surfaces of a LayerRegion.
+
+    `LayerRegion.fill_surfaces` is a `SurfaceCollection`, not a sequence: its
+    `.surfaces` property is what yields live `Surface` references.
+    """
+    fs = getattr(region, 'fill_surfaces', None)
     if fs is None:
         return []
+    surfaces = getattr(fs, 'surfaces', None)
+    if surfaces is not None and (not callable(surfaces)):
+        return list(surfaces)
+    if isinstance(fs, (list, tuple)):
+        return list(fs)
     try:
         return list(fs)
     except TypeError:
-        return [fs]
+        log.debug('fill_surfaces of %r is neither a collection nor iterable', type(fs).__name__)
+        return []
 
 def get_layer_z(layer) -> tuple[float, float] | None:
     pz = _call_or_attr(layer, 'print_z')
@@ -753,14 +879,25 @@ def get_layer_z(layer) -> tuple[float, float] | None:
     h = float(hh) if hh else 0.2
     return (z - h, z)
 
-def surface_centroid_xy_mm(surface, scale: float | None=None) -> tuple[float, float] | None:
-    expoly = _first_attr(surface, ('expolygon', 'expolygon', 'poly'))
-    contour = None
-    if expoly is not None:
-        contour = _first_attr(expoly, ('contour', 'outer', 'polygon'))
-    pts = None
-    if contour is not None:
-        pts = _first_attr(contour, ('points', 'pts'))
+def _contour_of(surface):
+    expoly = _first_attr(surface, ('expolygon', 'expoly', 'poly'))
+    if expoly is None:
+        return None
+    return _first_attr(expoly, ('contour', 'outer', 'polygon'))
+
+def _contour_centroid_scaled(contour) -> tuple[float, float] | None:
+    centroid = _call_or_attr(contour, 'centroid')
+    if centroid is not None:
+        x = getattr(centroid, 'x', None)
+        y = getattr(centroid, 'y', None)
+        if x is not None and y is not None:
+            return (float(x), float(y))
+    arr = _call_or_attr(contour, 'as_array')
+    if arr is not None:
+        a = np.asarray(arr, dtype=np.float64)
+        if a.ndim == 2 and a.shape[1] == 2 and (a.shape[0] > 0):
+            return (float(a[:, 0].mean()), float(a[:, 1].mean()))
+    pts = _first_attr(contour, ('points', 'pts'))
     if pts is None:
         return None
     sx = sy = 0.0
@@ -778,7 +915,16 @@ def surface_centroid_xy_mm(surface, scale: float | None=None) -> tuple[float, fl
         count += 1
     if count == 0:
         return None
-    mx, my = (sx / count, sy / count)
+    return (sx / count, sy / count)
+
+def surface_centroid_xy_mm(surface, scale: float | None=None) -> tuple[float, float] | None:
+    contour = _contour_of(surface)
+    if contour is None:
+        return None
+    c = _contour_centroid_scaled(contour)
+    if c is None:
+        return None
+    mx, my = c
     if scale is not None:
         return (mx / scale, my / scale)
     for s in SCALE_GUESSES:
@@ -787,38 +933,60 @@ def surface_centroid_xy_mm(surface, scale: float | None=None) -> tuple[float, fl
     return (mx, my)
 
 def guess_scale(surface) -> float:
-    c = surface_centroid_xy_mm(surface, scale=None)
-    if c is None:
-        return SCALE_GUESSES[0]
     area = _call_or_attr(surface, 'area')
     if area and abs(area) > 0:
         for s in SCALE_GUESSES:
             side = (abs(area) / (s * s)) ** 0.5
             if 0.001 < side < 10000.0:
                 return s
-    return SCALE_GUESSES[0]
+    return SCALED_UNITS_PER_MM
 
-def get_surface_type(surface) -> str | None:
-    st = _first_attr(surface, ('surface_type', 'type_'), None)
-    if st is None:
-        return None
-    return str(st).lower()
+def get_surface_type(surface):
+    return _first_attr(surface, ('surface_type', 'type_'), None)
 
-def set_surface_type(surface, solid_type: str=SOLID_TYPE_NAMES[0]) -> bool:
+def solid_surface_type(surface, fallback: str='internal_solid'):
+    """The value to assign to `Surface.surface_type` for solid infill.
+
+    Inside OrcaSlicer the field is a `SurfaceType` pybind enum, so the enum
+    member is resolved from the live value's own type; string mode is only for
+    hosts (and tests) that model the field as text.
+    """
+    current = get_surface_type(surface)
+    if current is None or isinstance(current, str):
+        return fallback
+    cls = type(current)
+    for name in SOLID_ENUM_NAMES:
+        member = getattr(cls, name, None)
+        if member is not None:
+            return member
+    return fallback
+
+def set_surface_type(surface, solid_type=None) -> bool:
+    value = solid_type
+    if value is None or isinstance(value, str):
+        resolved = solid_surface_type(surface, fallback=value or 'internal_solid')
+        value = resolved
     for attr in ('surface_type', 'type_'):
         if hasattr(surface, attr):
             try:
-                setattr(surface, attr, solid_type)
+                setattr(surface, attr, value)
                 return True
             except Exception as exc:
                 log.debug('set_surface_type failed on %r: %s', attr, exc)
     return False
 
 def is_sparse_like(surface) -> bool:
+    is_solid = _call_or_attr(surface, 'is_solid')
+    is_internal = _call_or_attr(surface, 'is_internal')
+    if isinstance(is_solid, bool) and isinstance(is_internal, bool):
+        return is_internal and (not is_solid)
+    if isinstance(is_solid, bool):
+        return not is_solid
     st = get_surface_type(surface)
     if st is None:
         return True
-    return any((h in st for h in SPARSE_HINTS)) and (not any((s in st for s in SOLID_TYPE_NAMES)))
+    name = str(st).lower()
+    return any((h in name for h in SPARSE_HINTS)) and (not any((s in name for s in SOLID_TYPE_NAMES)))
 
 def get_extra_perimeters(surface) -> int:
     ep = _first_attr(surface, ('extra_perimeters',), None)
@@ -850,7 +1018,8 @@ def probe(ctx) -> HostCapabilities:
             surfaces = get_fill_surfaces(region)
             if surfaces:
                 s = surfaces[0]
-                cap.surface_type_mode = 'writable' if hasattr(s, 'surface_type') or hasattr(s, 'type_') else 'missing'
+                st = get_surface_type(s)
+                cap.surface_type_mode = 'unavailable' if st is None else 'string' if isinstance(st, str) else type(st).__name__
                 cap.extra_perimeters_mode = 'writable' if hasattr(s, 'extra_perimeters') else 'missing'
                 cap.fill_surfaces_mode = f'n={len(surfaces)}'
                 return cap
@@ -860,9 +1029,6 @@ def probe(ctx) -> HostCapabilities:
 # ======================================================================
 # module: mutate
 # ======================================================================
-from dataclasses import dataclass
-import numpy as np
-
 @dataclass
 class MutationConfig:
     add_perimeters: int = 2
@@ -888,8 +1054,43 @@ class MutationStats:
         self.perimeters_added += other.perimeters_added
         self.perimeters_removed += other.perimeters_removed
 
-def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid, bbox) -> str:
-    x0, y0, _ = bbox[0]
+@dataclass(frozen=True)
+class FrameAlignment:
+    """Translation from slicer coordinates into the analysis grid's frame.
+
+    The analysed mesh and the sliced polygons need not share an origin (the
+    object is placed on the bed, and libslic3r keeps slices in the print
+    object's own frame), so the plan is anchored by matching bounding boxes
+    rather than by trusting either origin.
+    """
+    dx: float = 0.0
+    dy: float = 0.0
+    dz: float = 0.0
+
+    def to_grid_xy(self, x_mm: float, y_mm: float) -> tuple[float, float]:
+        return (x_mm - self.dx, y_mm - self.dy)
+
+    def to_grid_z(self, z_mm: float) -> float:
+        return z_mm - self.dz
+
+def compute_alignment(print_object, grid, layers=None) -> FrameAlignment:
+    dx = dy = dz = 0.0
+    footprint = object_footprint_mm(print_object)
+    if footprint is not None:
+        min_x, min_y, max_x, max_y = footprint
+        if max_x > min_x and max_y > min_y:
+            dx = min_x - float(grid.origin[0])
+            dy = min_y - float(grid.origin[1])
+    layers = iter_layers(print_object) if layers is None else layers
+    for layer in layers:
+        zr = get_layer_z(layer)
+        if zr is not None:
+            dz = zr[0] - float(grid.origin[2])
+            break
+    return FrameAlignment(dx=dx, dy=dy, dz=dz)
+
+def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid) -> str:
+    x0, y0 = (float(grid.origin[0]), float(grid.origin[1]))
     h = grid.h
     i = int((x_mm - x0) / h)
     j = int((y_mm - y0) / h)
@@ -902,8 +1103,9 @@ def _classify_xy(x_mm: float, y_mm: float, action: LayerAction, grid, bbox) -> s
         return 'relax'
     return 'neutral'
 
-def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig) -> MutationStats:
+def apply_to_region(region, action: LayerAction, grid, cfg: MutationConfig, alignment: FrameAlignment | None=None) -> MutationStats:
     stats = MutationStats()
+    align = alignment or FrameAlignment()
     scale = None
     for surface in get_fill_surfaces(region):
         if scale is None:
@@ -912,7 +1114,8 @@ def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig
         if xy is None:
             stats.surfaces_skipped_no_xy += 1
             continue
-        cls = _classify_xy(xy[0], xy[1], action, grid, bbox)
+        gx, gy = align.to_grid_xy(xy[0], xy[1])
+        cls = _classify_xy(gx, gy, action, grid)
         if cls == 'reinforce':
             cur = get_extra_perimeters(surface)
             target = min(cur + cfg.add_perimeters, cfg.max_extra_perimeters)
@@ -929,24 +1132,25 @@ def apply_to_region(region, action: LayerAction, grid, bbox, cfg: MutationConfig
                 stats.perimeters_removed += cur
     return stats
 
-def apply_plan_to_object(print_object, plan, grid, bbox, cfg: MutationConfig) -> MutationStats:
+def apply_plan_to_object(print_object, plan, grid, cfg: MutationConfig, alignment: FrameAlignment | None=None) -> MutationStats:
     total = MutationStats()
-    for layer in iter_layers(print_object):
+    layers = iter_layers(print_object)
+    align = alignment if alignment is not None else compute_alignment(print_object, grid, layers)
+    for layer in layers:
         zr = get_layer_z(layer)
         if zr is None:
             continue
-        z_mid = (zr[0] + zr[1]) * 0.5
+        z_mid = align.to_grid_z((zr[0] + zr[1]) * 0.5)
         for action in plan.actions:
-            if action.z0_mm <= z_mid <= action.z1_mm or (z_mid >= action.z0_mm and z_mid < action.z1_mm):
+            if action.z0_mm <= z_mid < action.z1_mm or (action is plan.actions[-1] and z_mid == action.z1_mm):
                 for region in iter_regions(layer):
-                    total.merge(apply_to_region(region, action, grid, bbox, cfg))
+                    total.merge(apply_to_region(region, action, grid, cfg, align))
                 break
     return total
 
 # ======================================================================
 # module: receipt
 # ======================================================================
-from dataclasses import dataclass
 PLA_DENSITY_G_CM3 = 1.24
 PLA_VIRGIN_KG_CO2E_PER_KG = 5.76
 PLA_RECYCLED_KG_CO2E_PER_KG = 2.47
@@ -981,8 +1185,17 @@ def _num(value, spec='{:.2f}') -> str:
     except (TypeError, ValueError):
         return str(value)
 
+def _mutation_line(stats: dict, label: str, layers_key: str, count_key: str, noun: str) -> str:
+    """Distinguish "no mutations ran" (analysis only) from "ran and changed nothing"."""
+    layers = stats.get(layers_key, 0)
+    if count_key not in stats:
+        return f';ECOSLICE {label}: {layers} layers planned (applied during slicing)'
+    return f';ECOSLICE {label}: {layers} layers, {stats[count_key]} {noun}'
+RECEIPT_BEGIN = ';ECOSLICE BEGIN ----------------------------------------------------------'
+RECEIPT_END = ';ECOSLICE END ------------------------------------------------------------'
+
 def format_receipt(stats: dict) -> list[str]:
-    lines = [';ECOSLICE BEGIN ----------------------------------------------------------', f";ECOSLICE mode            : {stats.get('mode', 'n/a')}", f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}", f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}", f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)", f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa", f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}", f";ECOSLICE reinforced      : {stats.get('reinforced_layers', 0)} layers, {stats.get('perimeters_added', 0)} extra perimeter-lines added", f";ECOSLICE relaxed         : {stats.get('relaxed_layers', 0)} layers, {stats.get('perimeters_removed', 0)} perimeter-lines removed", f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized", f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)", ';ECOSLICE sources: ' + ' | '.join(CITATIONS), ';ECOSLICE estimate-only   : true (authoritative numbers come from G-code footers)', ';ECOSLICE END ------------------------------------------------------------']
+    lines = [RECEIPT_BEGIN, f";ECOSLICE mode            : {stats.get('mode', 'n/a')}", f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}", f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}", f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)", f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa", f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}", _mutation_line(stats, 'reinforced      ', 'reinforced_layers', 'perimeters_added', 'extra perimeter-lines added'), _mutation_line(stats, 'relaxed         ', 'relaxed_layers', 'perimeters_removed', 'perimeter-lines removed'), f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized", f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)", ';ECOSLICE sources: ' + ' | '.join(CITATIONS), ';ECOSLICE estimate-only   : true (authoritative numbers come from G-code footers)', RECEIPT_END]
     return lines
 
 def receipt_block(stats: dict) -> str:
@@ -991,13 +1204,9 @@ def receipt_block(stats: dict) -> str:
 # ======================================================================
 # module: pipeline
 # ======================================================================
-import logging
-import time
-from dataclasses import dataclass, field
-from typing import Optional
-import numpy as np
 log = logging.getLogger('ecoslice')
 DEFAULT_RESOLUTION = 32
+MAX_ELEMENTS = 150000
 
 @dataclass
 class Analysis:
@@ -1006,17 +1215,19 @@ class Analysis:
     grid: object
     fem: object
     plan: Plan
-    bbox: tuple
     wall_seconds: float
     savings: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
     def stats(self, cfg: MutationConfig, mutation: MutationStats | None=None) -> dict:
-        d = {'mode': 'load-aware walls & infill', 'load_case': self.load_case.description[:60] or '(unnamed)', 'safety_factor': self.load_case.safety_factor, 'allowable_mpa': self.plan.allowable_mpa, 'max_vm_mpa': self.plan.max_vm_mpa, 'solver': self.fem.solver, 'voxels': f'{self.grid.shape[0]}x{self.grid.shape[1]}x{self.grid.shape[2]}', 'reinforced_layers': self.plan.n_reinforced_layers, 'relaxed_layers': self.plan.n_relaxed_layers}
+        d = {'mode': 'load-aware walls & infill', 'load_case': self.load_case.description[:60] or '(unnamed)', 'load_case_source': self.load_case.source, 'safety_factor': self.load_case.safety_factor, 'allowable_mpa': self.plan.allowable_mpa, 'max_vm_mpa': self.plan.max_vm_mpa, 'solver': f'{self.fem.solver} @ {self.fem.n_dof} dof', 'voxels': f'{self.grid.shape[0]}x{self.grid.shape[1]}x{self.grid.shape[2]}', 'reinforced_layers': self.plan.n_reinforced_layers, 'relaxed_layers': self.plan.n_relaxed_layers, 'analysis_seconds': round(self.wall_seconds, 2)}
+        if self.notes:
+            d['notes'] = '; '.join(self.notes)
         if mutation is not None:
             d['perimeters_added'] = mutation.perimeters_added
             d['perimeters_removed'] = mutation.perimeters_removed
+            d['surfaces_solidified'] = mutation.surfaces_solidified
         d.update(self.savings)
-        d.update({f'est_{k}': v for k, v in self.savings.items()})
         return d
 
 class EcoSlicePipeline:
@@ -1036,26 +1247,49 @@ class EcoSlicePipeline:
             return self._explicit_load_case
         return extract_load_case(description)
 
-    def analyze_mesh(self, vertices: np.ndarray, triangles: np.ndarray, description: str='', object_key: str='obj') -> Analysis:
-        t0 = time.perf_counter()
-        lc = self.load_case_for(description)
-        grid = voxelize(vertices, triangles, resolution=self.resolution)
-        bbox = (tuple(grid.origin.tolist()), tuple((grid.origin + np.array(grid.shape) * grid.h).tolist()))
+    def _voxelize_within_budget(self, vertices, triangles, notes: list[str]):
+        resolution = self.resolution
+        previous = None
+        while True:
+            grid = voxelize(vertices, triangles, resolution=resolution)
+            elements = int(grid.mask.sum())
+            if elements == 0:
+                raise ValueError('voxelization produced no solid cells — is the mesh closed?')
+            if elements <= MAX_ELEMENTS or resolution <= 12 or elements == previous:
+                return grid
+            previous = elements
+            resolution = max(12, int(resolution * (MAX_ELEMENTS / elements) ** (1 / 3)))
+            notes.append(f'resolution reduced to {resolution} to stay under {MAX_ELEMENTS} elements')
+
+    def _solver_faces(self, lc: LoadCase, notes: list[str]) -> tuple[list[str], str, np.ndarray]:
+        constraint_faces = [c.face for c in lc.constraints]
+        constrained = {canonical_face(f) for f in constraint_faces}
         total_force = np.zeros(3)
-        primary_face = 'z-'
-        max_mag = -1.0
+        primary = lc.forces[0]
         for f in lc.forces:
-            d = np.asarray(f.normalized()) * f.magnitude_n
-            total_force += d
-            if f.magnitude_n > max_mag:
-                max_mag = f.magnitude_n
-                primary_face = f.face
-        constraint_face = lc.constraints[0].face
-        fem = solve_voxel_fem(grid, fixed_faces=[constraint_face], load_face=primary_face, load_vector_n=total_force, young_modulus_mpa=lc.young_modulus_mpa, poisson=lc.poisson)
+            total_force += np.asarray(f.normalized()) * f.magnitude_n
+            if f.magnitude_n > primary.magnitude_n:
+                primary = f
+        if np.linalg.norm(total_force) < 1e-09:
+            total_force = np.asarray(primary.normalized()) * primary.magnitude_n
+            notes.append('opposing forces cancelled; solved for the dominant force only')
+        load_face = canonical_face(primary.face)
+        if load_face in constrained:
+            load_face = opposite_face(load_face)
+            notes.append(f'load face {primary.face} is held by the fixture; load applied on {load_face} instead')
+        return (constraint_faces, load_face, total_force)
+
+    def analyze_mesh(self, vertices: np.ndarray, triangles: np.ndarray, description: str='', object_id: str='obj') -> Analysis:
+        t0 = time.perf_counter()
+        notes: list[str] = []
+        lc = self.load_case_for(description)
+        grid = self._voxelize_within_budget(vertices, triangles, notes)
+        constraint_faces, load_face, total_force = self._solver_faces(lc, notes)
+        fem = solve_voxel_fem(grid, fixed_faces=constraint_faces, load_face=load_face, load_vector_n=total_force, young_modulus_mpa=lc.young_modulus_mpa, poisson=lc.poisson)
         plan = plan_from_stress(grid, fem.von_mises, yield_mpa=lc.yield_mpa, safety_factor=lc.safety_factor, layer_height_mm=self.layer_height_mm)
-        analysis = Analysis(object_key=object_key, load_case=lc, grid=grid, fem=fem, plan=plan, bbox=bbox, wall_seconds=time.perf_counter() - t0)
+        analysis = Analysis(object_key=object_id, load_case=lc, grid=grid, fem=fem, plan=plan, wall_seconds=time.perf_counter() - t0, notes=notes)
         analysis.savings = self._estimate_savings(plan, grid)
-        self.analyses[object_key] = analysis
+        self.analyses[object_id] = analysis
         return analysis
 
     def _estimate_savings(self, plan: Plan, grid) -> dict:
@@ -1075,25 +1309,35 @@ class EcoSlicePipeline:
         saved = max(uniform_g - added_g, 0.0)
         return {'added_grams': round(added_g, 3), 'uniform_baseline_grams': round(uniform_g, 3), 'saved_vs_uniform_grams': round(saved, 3), 'co2e_saved_vs_uniform_g': round(co2e_g(saved), 2)}
 
-    def run_offline(self, vertices, triangles, description: str, object_key: str='obj') -> Analysis:
-        analysis = self.analyze_mesh(vertices, triangles, description, object_key)
-        return analysis
+    def run_offline(self, vertices, triangles, description: str, object_id: str='obj') -> Analysis:
+        return self.analyze_mesh(vertices, triangles, description, object_id)
+
+    def analysis_for(self, obj) -> Analysis | None:
+        key = object_key(obj)
+        analysis = self.analyses.get(key)
+        if analysis is not None:
+            return analysis
+        mesh = get_mesh(obj)
+        if mesh is None:
+            log.warning('no mesh access for %s', key)
+            return None
+        try:
+            return self.analyze_mesh(mesh[0], mesh[1], self.description, key)
+        except Exception as exc:
+            log.warning('analysis failed for %s: %s', key, exc)
+            return None
 
     def apply_mutations(self, ctx) -> MutationStats:
         total = MutationStats()
-        objs = iter_print_objects(ctx)
-        for idx, obj in enumerate(objs):
-            key = f'obj{idx}'
-            analysis = self.analyses.get(key)
+        for obj in iter_print_objects(ctx):
+            analysis = self.analysis_for(obj)
             if analysis is None:
-                mesh = get_mesh(obj)
-                if mesh is None:
-                    continue
-                analysis = self.analyze_mesh(mesh[0], mesh[1], self.description, key)
+                continue
             try:
-                total.merge(apply_plan_to_object(obj, analysis.plan, analysis.grid, analysis.bbox, self.cfg))
+                alignment = compute_alignment(obj, analysis.grid)
+                total.merge(apply_plan_to_object(obj, analysis.plan, analysis.grid, self.cfg, alignment))
             except Exception as exc:
-                log.warning('mutation failed on %s: %s', key, exc)
+                log.warning('mutation failed on %s: %s', analysis.object_key, exc)
         return total
 
     def on_pos_slice(self, ctx):
@@ -1101,17 +1345,15 @@ class EcoSlicePipeline:
             if self.capabilities is None:
                 self.capabilities = probe(ctx)
                 log.info('host capabilities: %s', self.capabilities.as_dict())
-            objs = iter_print_objects(ctx)
-            for idx, obj in enumerate(objs):
-                key = f'obj{idx}'
-                if key in self.analyses:
+            if self.layer_height_mm is None:
+                self.layer_height_mm = _config_float(ctx, 'layer_height')
+            for obj in iter_print_objects(ctx):
+                if object_key(obj) in self.analyses:
                     continue
-                mesh = get_mesh(obj)
-                if mesh is None:
-                    log.warning('no mesh access for %s', key)
+                a = self.analysis_for(obj)
+                if a is None:
                     continue
-                a = self.analyze_mesh(mesh[0], mesh[1], self.description, key)
-                log.info('analyzed %s in %.2fs: maxVM=%.1f MPa allow=%.1f MPa reinforced=%d relaxed=%d', key, a.wall_seconds, a.plan.max_vm_mpa, a.plan.allowable_mpa, a.plan.n_reinforced_layers, a.plan.n_relaxed_layers)
+                log.info('analyzed %s in %.2fs: maxVM=%.1f MPa allow=%.1f MPa reinforced=%d relaxed=%d', a.object_key, a.wall_seconds, a.plan.max_vm_mpa, a.plan.allowable_mpa, a.plan.n_reinforced_layers, a.plan.n_relaxed_layers)
         except Exception as exc:
             log.exception('posSlice hook failed (non-fatal): %s', exc)
         return ctx
@@ -1119,7 +1361,10 @@ class EcoSlicePipeline:
     def on_pos_prepare_infill(self, ctx):
         try:
             stats = self.apply_mutations(ctx)
-            self._last_mutation = stats
+            if self._last_mutation is None:
+                self._last_mutation = stats
+            else:
+                self._last_mutation.merge(stats)
             log.info('mutations: +%d perimeters added, %d removed; %d solidified', stats.perimeters_added, stats.perimeters_removed, stats.surfaces_solidified)
         except Exception as exc:
             log.exception('posPrepareInfill hook failed (non-fatal): %s', exc)
@@ -1127,9 +1372,8 @@ class EcoSlicePipeline:
 
     def on_gcode_postprocess(self, gcode_text: str) -> str:
         try:
-            agg = self._aggregate_stats()
-            block = receipt_block(agg)
-            lines = gcode_text.splitlines()
+            block = receipt_block(self._aggregate_stats())
+            lines = [ln for ln in gcode_text.splitlines() if not ln.startswith(';ECOSLICE')]
             insert_at = 0
             for i, ln in enumerate(lines[:50]):
                 if ln.startswith(';') and 'generated' in ln.lower():
@@ -1144,8 +1388,23 @@ class EcoSlicePipeline:
         if not self.analyses:
             return {'mode': 'eco-slice idle (no analysis ran)'}
         keys = sorted(self.analyses)
-        a = self.analyses[keys[0]]
-        return a.stats(self.cfg)
+        stats = self.analyses[keys[0]].stats(self.cfg, self._last_mutation)
+        if len(keys) > 1:
+            stats['objects_analyzed'] = len(keys)
+        return stats
+
+def _config_float(ctx, key: str) -> float | None:
+    getter = getattr(ctx, 'config_value', None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter(key)
+    except Exception:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 def default_pipeline(description: str='', **kw) -> EcoSlicePipeline:
     return EcoSlicePipeline(description=description, **kw)
@@ -1155,11 +1414,19 @@ try:
 except ImportError:
     orca = None
 
-import json as _adapter_json
 from pathlib import Path as _AdapterPath
 
 PLUGIN_NAME = "EcoSlice"
 PLUGIN_VERSION = __version__
+
+DEFAULT_CONFIG = {
+    "description": "shelf bracket holding 8 kg, load downward; screwed to left wall",
+    "resolution": 32,
+    "add_perimeters": 2,
+    "max_extra_perimeters": 4,
+    "enable_solid_infill": True,
+    "enable_relax": True,
+}
 
 
 def create_pipeline(**kwargs) -> EcoSlicePipeline:
@@ -1186,31 +1453,24 @@ def describe() -> dict:
     }
 
 
-DEFAULT_CONFIG_JSON = (
-    "{{"
-    "\"description\": \"shelf bracket holding 8 kg, load downward; screwed to left wall\", "
-    "\"resolution\": 40, "
-    "\"add_perimeters\": 2, "
-    "\"max_extra_perimeters\": 4, "
-    "\"enable_solid_infill\": true, "
-    "\"enable_relax\": true"
-    "}}"
-)
-
-
 def _apply_config(pipe: EcoSlicePipeline, cfg_json: str) -> None:
     try:
-        cfg = _adapter_json.loads(cfg_json or "{}")
+        cfg = json.loads(cfg_json or "{}")
     except Exception:
         cfg = {}
-    pipe.description = str(cfg.get("description", pipe.description or ""))
-    if isinstance(cfg.get("resolution"), int) and 8 <= cfg["resolution"] <= 96:
-        pipe.resolution = int(cfg["resolution"])
+    if not isinstance(cfg, dict):
+        cfg = {}
+    merged = dict(DEFAULT_CONFIG)
+    merged.update(cfg)
+    pipe.description = str(merged.get("description", ""))
+    resolution = merged.get("resolution")
+    if isinstance(resolution, int) and 8 <= resolution <= 96:
+        pipe.resolution = resolution
     mc = pipe.cfg
-    mc.add_perimeters = int(cfg.get("add_perimeters", mc.add_perimeters))
-    mc.max_extra_perimeters = int(cfg.get("max_extra_perimeters", mc.max_extra_perimeters))
-    mc.enable_solid_infill = bool(cfg.get("enable_solid_infill", mc.enable_solid_infill))
-    mc.enable_relax = bool(cfg.get("enable_relax", mc.enable_relax))
+    mc.add_perimeters = int(merged.get("add_perimeters", mc.add_perimeters))
+    mc.max_extra_perimeters = int(merged.get("max_extra_perimeters", mc.max_extra_perimeters))
+    mc.enable_solid_infill = bool(merged.get("enable_solid_infill", mc.enable_solid_infill))
+    mc.enable_relax = bool(merged.get("enable_relax", mc.enable_relax))
 
 
 if orca is not None:
@@ -1228,30 +1488,43 @@ if orca is not None:
             return None
 
     class EcoSliceCapability(orca.slicing.SlicingPipelineCapabilityBase):
+        """execute(ctx) is called for every pipeline step, so it dispatches on ctx.step."""
+
         def get_name(self) -> str:
             return PLUGIN_NAME
 
         def has_config_ui(self) -> bool:
             return False
 
-        def get_default_config(self) -> str:
-            return DEFAULT_CONFIG_JSON
+        def get_default_config(self) -> dict:
+            return dict(DEFAULT_CONFIG)
 
         def execute(self, ctx):
+            step = getattr(ctx, "step", None)
+            if step not in (_Step.posSlice, _Step.posPrepareInfill, _Step.psGCodePostProcess):
+                return _result("skipped", "step not handled by EcoSlice")
+
             pipe = get_pipeline()
             try:
                 _apply_config(pipe, self.get_config())
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("EcoSlice config unreadable (%s); using defaults", exc)
+
             try:
-                step = ctx.step
                 if step == _Step.psGCodePostProcess:
                     return self._post(ctx, pipe)
+                if ctx.cancelled():
+                    return _result("skipped", "slicing cancelled")
                 if step == _Step.posPrepareInfill:
                     pipe.on_pos_prepare_infill(ctx)
-                    return _result("success", "EcoSlice infill mutations applied")
+                    stats = pipe._last_mutation
+                    added = stats.perimeters_added if stats else 0
+                    removed = stats.perimeters_removed if stats else 0
+                    return _result(
+                        "success", f"EcoSlice: +{added} / -{removed} perimeter-lines"
+                    )
                 pipe.on_pos_slice(ctx)
-                a = pipe.analyses.get("obj0")
+                a = next(iter(pipe.analyses.values()), None)
                 msg = f"EcoSlice analyzed {len(pipe.analyses)} object(s)"
                 if a is not None:
                     msg += (f"; maxVM={a.plan.max_vm_mpa:.1f} MPa allow="
@@ -1269,26 +1542,20 @@ if orca is not None:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 return _result("failure", f"cannot read gcode: {exc}")
-            stats = pipe._aggregate_stats()
-            mutation = getattr(pipe, "_last_mutation", None)
-            if mutation is not None:
-                for k, v in {
-                    "perimeters_added": mutation.perimeters_added,
-                    "perimeters_removed": mutation.perimeters_removed,
-                }.items():
-                    stats.setdefault(k, v)
             out = pipe.on_gcode_postprocess(text)
-            p.write_text(out, encoding="utf-8")
+            if out == text:
+                return _result("skipped", "receipt already present")
+            try:
+                p.write_text(out, encoding="utf-8")
+            except OSError as exc:
+                return _result("failure", f"cannot write gcode: {exc}")
             return _result("success", "EcoSlice carbon receipt embedded")
-
-else:
-    EcoSliceCapability = None
-
-
-if orca is not None:
 
     @orca.plugin
     class EcoSlicePackage(orca.base):
         def register_capabilities(self) -> None:
             orca.register_capability(EcoSliceCapability)
+
+else:
+    EcoSliceCapability = None
 

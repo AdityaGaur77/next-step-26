@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from ecoslice.mapping import plan_from_stress, region_boundary_length_mm, plan_summary_table
-from ecoslice.voxelize import VoxelGrid, box_mesh, voxelize
+from ecoslice.voxelize import box_mesh, voxelize
 
 
 def _grid_and_stress():

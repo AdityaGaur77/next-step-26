@@ -20,9 +20,11 @@ behavior on the installed nightly.
 
 | probe | result |
 |---|---|
-| mesh access (`vertices()`/`triangles()`) | ☐ ok ☐ shape/dtype differs: ______ |
+| mesh via `model_object().volumes()[0].mesh()` | ☐ ok ☐ shape/dtype differs: ______ |
+| `fill_surfaces.surfaces` yields Surface refs | ☐ ok ☐ differs: ______ |
 | `extra_perimeters` write | ☐ MUTATION OK ☐ NO-OP ☐ FAILED |
-| `surface_type` reclassification | ☐ MUTATION OK ☐ FAILED |
+| `surface_type = SurfaceType.stInternalSolid` | ☐ MUTATION OK ☐ FAILED |
+| plan lands on the part (root thicker, not tip) | ☐ yes ☐ no — check `compute_alignment` |
 | preview shows thicker walls near spike layer | ☐ yes ☐ no |
 
 6. **G-code diff.** Slice once with the spike disabled (rename file), once enabled:

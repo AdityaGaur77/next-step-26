@@ -51,25 +51,41 @@ def _num(value, spec="{:.2f}") -> str:
         return str(value)
 
 
+def _mutation_line(stats: dict, label: str, layers_key: str, count_key: str, noun: str) -> str:
+    """Distinguish "no mutations ran" (analysis only) from "ran and changed nothing"."""
+    layers = stats.get(layers_key, 0)
+    if count_key not in stats:
+        return f";ECOSLICE {label}: {layers} layers planned (applied during slicing)"
+    return f";ECOSLICE {label}: {layers} layers, {stats[count_key]} {noun}"
+
+
+RECEIPT_BEGIN = ";ECOSLICE BEGIN ----------------------------------------------------------"
+RECEIPT_END = ";ECOSLICE END ------------------------------------------------------------"
+
+
 def format_receipt(stats: dict) -> list[str]:
     lines = [
-        ";ECOSLICE BEGIN ----------------------------------------------------------",
+        RECEIPT_BEGIN,
         f";ECOSLICE mode            : {stats.get('mode', 'n/a')}",
         f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}",
         f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}",
         f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)",
         f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa",
         f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}",
-        f";ECOSLICE reinforced      : {stats.get('reinforced_layers', 0)} layers, "
-        f"{stats.get('perimeters_added', 0)} extra perimeter-lines added",
-        f";ECOSLICE relaxed         : {stats.get('relaxed_layers', 0)} layers, "
-        f"{stats.get('perimeters_removed', 0)} perimeter-lines removed",
+        _mutation_line(
+            stats, "reinforced      ", "reinforced_layers", "perimeters_added",
+            "extra perimeter-lines added",
+        ),
+        _mutation_line(
+            stats, "relaxed         ", "relaxed_layers", "perimeters_removed",
+            "perimeter-lines removed",
+        ),
         f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized",
         f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g "
         f"(-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)",
         ";ECOSLICE sources: " + " | ".join(CITATIONS),
         ";ECOSLICE estimate-only   : true (authoritative numbers come from G-code footers)",
-        ";ECOSLICE END ------------------------------------------------------------",
+        RECEIPT_END,
     ]
     return lines
 

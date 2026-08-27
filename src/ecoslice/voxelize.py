@@ -54,11 +54,21 @@ def _triangle_hit_xs(tri2d: np.ndarray, tri_x: np.ndarray, p: np.ndarray) -> np.
     return lam0 * xa[inside] + lam1 * xb[inside] + lam2 * xc[inside]
 
 
+MIN_CELLS_ACROSS_THINNEST = 4
+
+
 def voxelize(
     vertices: np.ndarray,
     triangles: np.ndarray,
     resolution: int = 32,
+    min_cells_across: int = MIN_CELLS_ACROSS_THINNEST,
 ) -> VoxelGrid:
+    """Solid voxelization by ray parity along +x.
+
+    Cell size is driven by the longest axis, but never coarser than
+    `min_cells_across` cells through the thinnest one: a plate or bracket with
+    two elements through its thickness cannot represent bending at all.
+    """
     v = np.asarray(vertices, dtype=np.float64)
     t = np.asarray(triangles, dtype=np.int64)
     if v.ndim != 2 or v.shape[1] != 3:
@@ -68,6 +78,8 @@ def voxelize(
     mn, mx = v.min(axis=0), v.max(axis=0)
     ext = np.maximum(mx - mn, 1e-9)
     h = float(ext.max()) / float(resolution)
+    if min_cells_across > 0:
+        h = min(h, float(ext.min()) / float(min_cells_across))
     n = np.maximum(np.ceil(ext / h).astype(np.int64), 1)
 
     tri = v[t]
@@ -76,7 +88,6 @@ def voxelize(
 
     cy = mn[1] + (np.arange(n[1]) + 0.5) * h
     cz = mn[2] + (np.arange(n[2]) + 0.5) * h
-    cx_lo = mn[0]
     cx_centers = mn[0] + (np.arange(n[0]) + 0.5) * h
 
     mask = np.zeros(tuple(int(x) for x in n), dtype=bool)

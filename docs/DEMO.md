@@ -12,8 +12,9 @@
   when an API key is present; deterministic parser otherwise.
 
 ## 1:20–2:20 — real FEA inside the slicer
-- Console log: voxelization → FEM solve time (~0.3 s) → max von Mises vs allowable.
-- `tools/offline_demo.py --resolution 64` on screen as the readable version of the same numbers.
+- Console log: voxelization → FEM solve (0.05 s on the bracket; seconds on a bulky part) →
+  max von Mises vs allowable, and which solver ran.
+- `tools/offline_demo.py --resolution 40` on screen as the readable version of the same numbers.
 - One line: "Trilinear hexahedra, validated against the closed-form cantilever solution."
 
 ## 2:20–3:20 — the mutation (the wow)

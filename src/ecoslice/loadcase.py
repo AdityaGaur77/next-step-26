@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+log = logging.getLogger("ecoslice.loadcase")
 
 
 @dataclass
@@ -153,7 +156,6 @@ def parse_description(text: str) -> LoadCase:
     forces: list[Force] = []
     constraints: dict[str, Constraint] = {}
 
-    attach_zone = None
     m_attach = _ATTACH_RE.search(desc)
     tail = desc[m_attach.start() :] if m_attach else desc
     for pat, face in _FACE_PATTERNS:
@@ -228,17 +230,29 @@ Part description:
 """
 
 
-def llm_parse_description(text: str, model: str = "claude-sonnet-4-20250514") -> Optional[LoadCase]:
+DEFAULT_MODEL = "claude-opus-5"
+
+
+def llm_parse_description(text: str, model: str | None = None) -> Optional[LoadCase]:
+    """Structured load case via the Messages API.
+
+    Raw HTTP on purpose: the plugin runs inside OrcaSlicer's embedded interpreter,
+    where every PEP 723 dependency is installed by the host at load time, so the
+    Anthropic SDK is not available and stdlib urllib is the only transport.
+    Any failure returns None and the deterministic parser takes over.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
+    model = model or os.environ.get("ECOSLICE_MODEL") or DEFAULT_MODEL
     try:
         import urllib.request
 
         body = json.dumps(
             {
                 "model": model,
-                "max_tokens": 700,
+                "max_tokens": 2048,
+                "output_config": {"effort": "low"},
                 "messages": [{"role": "user", "content": _LLM_PROMPT + text}],
             }
         ).encode()
@@ -253,11 +267,16 @@ def llm_parse_description(text: str, model: str = "claude-sonnet-4-20250514") ->
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
-        content = "".join(b.get("text", "") for b in data.get("content", []))
+        if data.get("stop_reason") == "refusal":
+            log.warning("load-case extraction refused by the model; using the heuristic parser")
+            return None
+        content = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         lc = LoadCase.from_json(content)
         lc.description = text.strip()
+        lc.source = f"llm:{model}"
         return lc
-    except Exception:
+    except Exception as exc:
+        log.info("LLM load-case extraction unavailable (%s); using the heuristic parser", exc)
         return None
 
 
