@@ -76,13 +76,14 @@
    flattens modules into one namespace, preserves `__future__`, and appends a thin adapter
    (`execute(ctx)` dispatch on `ctx.step` — the host calls it for *every* step). Tests import
    the bundle standalone and assert the default config is a dict, as the host requires.
-5b. **One supported build interpreter: Python ≥3.12.** `ast.unparse` is not stable across versions
-   — from 3.12 (PEP 701) it re-quotes f-strings that reuse the outer quote inside the expression,
-   output older interpreters cannot even parse. A bundle built on 3.11 therefore differs byte-wise
-   from one built on 3.12 and fails the CI staleness gate, which pins itself to 3.12. The builder
-   refuses to run below 3.12 rather than emit a bundle that gate will reject, and the bundle-import
-   tests skip below 3.12 while the pure-text checks (PEP 723 header, no intra-package imports) run
-   everywhere.
+5b. **The builder probes `ast.unparse`, it does not trust the version number.** Some CPython 3.12
+   patch releases render an f-string that reuses the outer quote inside the expression as
+   `f'{d['k']}'` rather than the `f"{d['k']}"` that 3.11, 3.13 and current 3.12s produce. A bundle
+   built there is byte-different from one built anywhere else — failing the staleness gate — and is
+   a syntax error before 3.12. Since the affected releases sit *inside* the 3.12 range, no version
+   bound describes them, so `build_plugin.py` unparses a one-line probe and refuses to build when
+   the result is not the canonical form. Verified: 3.11, 3.13 and CI's 3.12 all reproduce the
+   committed bundle byte-for-byte.
 6. **Never crash the slicer.** Every hook wraps its body in try/except with logged context.
 
 ## Performance envelope

@@ -4,12 +4,19 @@ import ast
 import sys
 from pathlib import Path
 
-# `ast.unparse` is not stable across interpreter versions: from 3.12 (PEP 701) it
-# emits f-strings that reuse the outer quote inside the expression, which older
-# interpreters cannot even parse. The bundle therefore has ONE supported build
-# interpreter — the one the host runs and the one CI's staleness gate uses.
-# Building on anything older produces a bundle that gate will reject.
-MIN_BUILD_PYTHON = (3, 12)
+# Some CPython 3.12 patch releases unparse an f-string that reuses the outer quote
+# inside the expression as f'{d['k']}' (PEP 701 syntax) instead of the f"{d['k']}"
+# that 3.11, 3.13 and later 3.12s emit. That output is byte-different from every
+# other interpreter's — failing CI's staleness gate — and is a syntax error before
+# 3.12. Probing the behaviour is exact where a version comparison is not: the
+# affected patch releases sit *inside* the 3.12 range, so no version bound
+# describes them.
+_UNPARSE_PROBE = "x = f'{d[\"k\"]}'"
+_UNPARSE_CANONICAL = 'x = f"{d[\'k\']}"'
+
+
+def unparse_is_canonical() -> bool:
+    return ast.unparse(ast.parse(_UNPARSE_PROBE)) == _UNPARSE_CANONICAL
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "ecoslice"
@@ -280,13 +287,13 @@ def render_imports(entries: list[tuple]) -> str:
 
 
 def main() -> int:
-    if sys.version_info < MIN_BUILD_PYTHON:
-        need = ".".join(str(v) for v in MIN_BUILD_PYTHON)
+    if not unparse_is_canonical():
         have = ".".join(str(v) for v in sys.version_info[:3])
         print(
-            f"error: the plugin bundle must be built with Python >= {need} (running {have}).\n"
-            f"       ast.unparse output differs across versions, so a bundle built here would\n"
-            f"       fail CI's staleness gate. Run: python{need} tools/build_plugin.py",
+            f"error: this interpreter (Python {have}) unparses f-strings in the PEP 701 form,\n"
+            f"       which is byte-different from every other interpreter's output and would\n"
+            f"       fail CI's bundle-staleness gate. Build with another interpreter\n"
+            f"       (3.11, 3.13, or a current 3.12): pythonX.Y tools/build_plugin.py",
             file=sys.stderr,
         )
         return 2

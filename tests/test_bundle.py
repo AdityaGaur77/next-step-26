@@ -9,18 +9,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin" / "ecoslice_core.py"
 
-# The bundle is generated for the host interpreter and declares
-# `requires-python = ">=3.12"`; since 3.12 `ast.unparse` emits PEP 701 f-strings
-# that older interpreters cannot parse. The library itself still supports 3.10+,
-# so importing the bundle is scoped to the versions it is built for — CI runs
-# 3.12 and 3.13, where these tests always execute.
-BUNDLE_PYTHON = (3, 12)
-requires_bundle_python = pytest.mark.skipif(
-    sys.version_info < BUNDLE_PYTHON,
-    reason="the generated bundle targets Python >= 3.12 (PEP 701 f-strings)",
-)
-
-
 @pytest.fixture(scope="module")
 def bundled():
     assert PLUGIN.exists(), "run tools/build_plugin.py first"
@@ -49,7 +37,6 @@ def test_no_relative_imports_in_bundle_text():
             pytest.fail(f"intra-package import survived bundling at line {i}: {line}")
 
 
-@requires_bundle_python
 def test_describe_reports_the_capability(bundled):
     d = bundled.describe()
     assert d["name"] == "EcoSlice"
@@ -57,7 +44,6 @@ def test_describe_reports_the_capability(bundled):
     assert "posPrepareInfill" in d["hooks"]
 
 
-@requires_bundle_python
 def test_bundled_pipeline_end_to_end(bundled):
     from ecoslice.voxelize import box_mesh
 
@@ -70,7 +56,6 @@ def test_bundled_pipeline_end_to_end(bundled):
     assert ";ECOSLICE BEGIN" in out
 
 
-@requires_bundle_python
 def test_default_config_is_a_valid_dict(bundled):
     """The host requires get_default_config() to hand back an object, not a string."""
     import json
@@ -81,7 +66,6 @@ def test_default_config_is_a_valid_dict(bundled):
     assert "{{" not in PLUGIN.read_text(encoding="utf-8")
 
 
-@requires_bundle_python
 def test_config_round_trips_into_the_pipeline(bundled):
     import json
 

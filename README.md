@@ -51,7 +51,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `src/ecoslice/` | library: voxelize, fem, loadcase, mapping, host_bridge, mutate, receipt, options, pipeline |
 | `plugin/ecoslice_core.py` | generated **single-file plugin** (PEP 723) — drop into `orca_plugins/` |
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
-| `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (**Python ≥3.12 only**) |
+| `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/offline_demo.py` | run the full analysis without OrcaSlicer (great for the video) |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
 | `docs/` | architecture, spike protocol, demo script |
@@ -67,16 +67,15 @@ python -m pytest                 # 101 tests: FEM validation, host-binding shape
 
 `pytest` works straight from a clone (`pythonpath` is set in `pyproject.toml`); `pyamg` is an
 optional extra (`pip install -e ".[amg]"`) that only changes which fallback the solver uses.
-The library supports Python ≥3.10; the four tests that *import the generated bundle* skip below
-3.12, because the bundle is built for the host's interpreter. CI runs 3.12 and 3.13, where they
-all execute.
+The library supports Python ≥3.10 and the whole suite, bundle import included, runs on all of
+them; CI covers 3.12 and 3.13.
 
 ## Install into OrcaSlicer (nightly ≥ 2.4.2)
 
-1. Run `python3.12 tools/build_plugin.py` (or use the committed bundle). **The bundle must be
-   built with Python ≥3.12** — `ast.unparse` emits PEP 701 f-strings from 3.12 onward, so a
-   bundle generated on an older interpreter fails CI's staleness gate. The script refuses to
-   run below 3.12 rather than producing one.
+1. Run `python tools/build_plugin.py` (or use the committed bundle). Some CPython 3.12 patch
+   releases unparse f-strings in a form no other interpreter emits, which would fail CI's
+   staleness gate; the builder probes for that behaviour and refuses to run on such an
+   interpreter rather than writing a bundle the gate will reject.
 2. Copy `plugin/ecoslice_core.py` into `<OrcaSlicer data dir>/orca_plugins/`
    (GUI: Help → Show Configuration Folder → `orca_plugins`).
 3. Slice a part; check console for `ecoslice` log lines and the G-code for the `;ECOSLICE` block.
