@@ -55,7 +55,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
-| `docs/` | architecture, spike protocol, demo script |
+| `docs/` | [running guide](docs/RUNNING.md), architecture, plugin API notes, spike protocol, demo script |
 
 ## Quick start (no OrcaSlicer needed)
 
@@ -78,11 +78,18 @@ them; CI covers 3.12 and 3.13.
    releases unparse f-strings in a form no other interpreter emits, which would fail CI's
    staleness gate; the builder probes for that behaviour and refuses to run on such an
    interpreter rather than writing a bundle the gate will reject.
-2. Copy `plugin/ecoslice_core.py` into `<OrcaSlicer data dir>/orca_plugins/`
-   (GUI: Help → Show Configuration Folder → `orca_plugins`).
-3. Slice a part; check console for `ecoslice` log lines and the G-code for the `;ECOSLICE` block.
-4. Optional LLM parsing: `set ANTHROPIC_API_KEY=...` before launching OrcaSlicer;
+2. **Plugins dialog → Local install**, and pick `plugin/ecoslice_core.py`. Copying the file
+   into `orca_plugins/` by hand does *not* work — discovery finds zero manifests; the host has
+   to create the folder and manifest sidecar itself.
+3. **Activate** it with the toggle in the Plugins dialog, then select the capability per process
+   profile: Process settings → **Others** → **Slicing Pipeline Plugin** → EcoSlice. The C++ hook
+   skips everything while that option is empty, so a plugin that is installed and activated but
+   not selected does nothing at all.
+4. Slice a part; check console for `ecoslice` log lines and the G-code for the `;ECOSLICE` block.
+5. Optional LLM parsing: `set ANTHROPIC_API_KEY=...` before launching OrcaSlicer;
    otherwise the deterministic heuristic parser is used.
+
+Full step-by-step, including the measurement protocol: **[docs/RUNNING.md](docs/RUNNING.md)**.
 
 **Day-1 gate first:** follow [docs/SPIKE.md](docs/SPIKE.md) with `spike/spike_extra_perimeters.py`.
 The plugin's host-facing calls are deliberately defensive (multiple attribute paths, never raises
