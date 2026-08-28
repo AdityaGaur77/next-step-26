@@ -30,7 +30,8 @@
 │                  │                + fill_surfaces reclass → internal_solid  │
 │                  │     relax: extra_perimeters → 0                          │
 │                  ▼                                                          │
-│  psGCodePostProcess ─► receipt.receipt_block  ;ECOSLICE … ;ECOSLICE END     │
+│  psGCodePostProcess ─► receipt.parse_gcode_footer (measured g / time / kWh) │
+│                  └─► receipt.receipt_block  ;ECOSLICE … ;ECOSLICE END       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,7 +45,8 @@
 | `mapping` | `plan_from_stress` → `Plan(actions[])`; `region_boundary_length_mm` | masks are **x-major** `(nx, ny)` |
 | `host_bridge` | `probe`, `current_object`/`iter_print_objects`, `object_key`, `get_mesh`, `object_footprint_mm`, surface R/W | verified binding paths first (`SurfaceCollection.surfaces`, `SurfaceType` enum, `Polygon.centroid()`), duck-typed fallbacks behind them; never raises into the slicer |
 | `mutate` | `MutationConfig`, `FrameAlignment`, `compute_alignment`, `apply_plan_to_object` | area-centroid classification in the aligned frame; caps extra perimeters |
-| `receipt` | constants + `receipt_block(stats)` | cites sources; marks estimates as estimates |
+| `receipt` | constants + `receipt_block(stats)`, `parse_gcode_footer` | cites sources; keeps modelled and measured numbers on separate lines |
+| `options` | `estimate_material`, `strength_confidence`, `build_options`, `PRESETS` | one FEM solve re-thresholded into Eco / Balanced / Maximum Strength |
 | `pipeline` | `EcoSlicePipeline` — hooks + `analyze_mesh` + offline driver | caches analyses per `PrintObject.id()`; element budget; idempotent receipt |
 
 ## Design decisions
@@ -60,6 +62,16 @@
    reports which access paths exist on the running build, and the receipt logs capabilities.
 4. **Honest economics.** Savings are framed as *"vs blanket-strengthening at equal safety factor"* —
    a like-for-like comparison the FEM justifies — plus authoritative footer diffs from real G-code.
+4b. **Count both levers.** Added mass is walls *and* the sparse→solid infill reclassification.
+   The infill term dominates (≈4× the wall term on the demo bracket); an estimate that counts
+   only perimeter lines understates what actually prints, so `options.estimate_material` is the
+   single implementation both the receipt and the option table go through.
+4c. **The blanket baseline follows the part.** `LayerAction.occupied_xy` carries the band's real
+   footprint, so the "if we strengthened everything" comparison is charged against the part, not
+   against its bounding rectangle.
+4d. **Confidence cannot flatter a failing part.** `strength_confidence` blends stress margin,
+   at-risk-voxel coverage and mesh adequacy — and is hard-capped below "high" whenever peak stress
+   exceeds yield/sf, because no wall or infill change rescues an under-sized part.
 5. **Single-file bundle via AST transform.** `tools/build_plugin.py` strips intra-package imports,
    flattens modules into one namespace, preserves `__future__`, and appends a thin adapter
    (`execute(ctx)` dispatch on `ctx.step` — the host calls it for *every* step). Tests import

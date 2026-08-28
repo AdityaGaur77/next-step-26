@@ -38,4 +38,5 @@ jobs:
       - name: Offline demo smoke
         run: |
           python tools/offline_demo.py --resolution 32 --json
+          python tools/offline_demo.py --resolution 32 --options
           python tools/offline_demo.py --part bracket --resolution 24 --json

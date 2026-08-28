@@ -17,6 +17,7 @@ MODULE_ORDER = [
     ("host_bridge", "host_bridge"),
     ("mutate", "mutate"),
     ("receipt", "receipt"),
+    ("options", "options"),
     ("pipeline", "pipeline"),
 ]
 
@@ -52,11 +53,13 @@ PLUGIN_VERSION = __version__
 
 DEFAULT_CONFIG = {
     "description": "shelf bracket holding 8 kg, load downward; screwed to left wall",
+    "option": "balanced",
     "resolution": 32,
     "add_perimeters": 2,
     "max_extra_perimeters": 4,
     "enable_solid_infill": True,
     "enable_relax": True,
+    "enable_solid_downgrade": False,
 }
 
 
@@ -98,10 +101,23 @@ def _apply_config(pipe: EcoSlicePipeline, cfg_json: str) -> None:
     if isinstance(resolution, int) and 8 <= resolution <= 96:
         pipe.resolution = resolution
     mc = pipe.cfg
-    mc.add_perimeters = int(merged.get("add_perimeters", mc.add_perimeters))
-    mc.max_extra_perimeters = int(merged.get("max_extra_perimeters", mc.max_extra_perimeters))
-    mc.enable_solid_infill = bool(merged.get("enable_solid_infill", mc.enable_solid_infill))
-    mc.enable_relax = bool(merged.get("enable_relax", mc.enable_relax))
+    # An option preset seeds the mutation strength; explicit keys still win over it,
+    # so a user who edits a single value does not silently get the whole preset.
+    preset = PRESETS_BY_KEY.get(str(merged.get("option", "")).strip().lower())
+    if preset is not None:
+        mc.add_perimeters = preset.add_perimeters
+        mc.max_extra_perimeters = preset.max_extra_perimeters
+        mc.enable_solid_infill = preset.enable_solid_infill
+        mc.enable_relax = preset.enable_relax
+    for key, caster in (
+        ("add_perimeters", int),
+        ("max_extra_perimeters", int),
+        ("enable_solid_infill", bool),
+        ("enable_relax", bool),
+        ("enable_solid_downgrade", bool),
+    ):
+        if key in cfg:
+            setattr(mc, key, caster(cfg[key]))
 
 
 if orca is not None:

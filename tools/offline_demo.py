@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ecoslice.mapping import plan_summary_table
+from ecoslice.options import options_table
 from ecoslice.pipeline import EcoSlicePipeline
 from ecoslice.receipt import receipt_block
 from ecoslice.voxelize import box_mesh, uv_sphere_mesh
@@ -43,6 +44,7 @@ def main(argv=None) -> int:
     ap.add_argument("--part", choices=list(PART_BUILDERS), default="cantilever")
     ap.add_argument("--resolution", type=int, default=48)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--options", action="store_true", help="show the Eco / Balanced / Maximum Strength table")
     args = ap.parse_args(argv)
 
     desc = DESCRIPTIONS[args.part]
@@ -63,6 +65,8 @@ def main(argv=None) -> int:
                     "solver": analysis.fem.solver,
                     "wall_seconds": round(analysis.wall_seconds, 2),
                     "savings": analysis.savings,
+                    "confidence": analysis.confidence.as_dict() if analysis.confidence else None,
+                    "options": [o.as_dict() for o in analysis.options],
                 },
                 indent=2,
             )
@@ -83,8 +87,15 @@ def main(argv=None) -> int:
           f"{analysis.plan.allowable_mpa:.1f} MPa (yield/sf)")
     disp = list(analysis.fem.face_displacement.values())[0]
     print(f"load-face defl: {abs(disp):.2f} mm")
+    if analysis.confidence is not None:
+        c = analysis.confidence
+        print(f"confidence    : {c.score:.2f} ({c.label}) - {'; '.join(c.reasons)}")
     print()
     print(plan_summary_table(analysis.plan))
+    if args.options:
+        print()
+        print("Options (one FEM solve, three thresholdings):")
+        print(options_table(analysis.options))
     print()
     print(receipt_block(analysis.stats(pipe.cfg)))
     return 0

@@ -17,21 +17,36 @@
 - `tools/offline_demo.py --resolution 40` on screen as the readable version of the same numbers.
 - One line: "Trilinear hexahedra, validated against the closed-form cantilever solution."
 
-## 2:20–3:20 — the mutation (the wow)
+## 2:20–3:00 — the mutation (the wow)
 - Slice again with the plugin enabled. Preview: extra perimeters + solid infill bloom exactly at
   the fixed root skins; mid-part stays light.
 - Before/after preview side-by-side — the 10 seconds that win the pitch.
 
+## 3:00–3:20 — three options, one solve
+- `python tools/offline_demo.py --resolution 40 --options`
+- Eco / Balanced / Maximum Strength side by side: added grams split into walls vs solid infill,
+  grams saved vs blanket-strengthening, added time and kWh, and a strength-confidence score.
+- One line: "Same FEM solve, three thresholdings — and the score refuses to say 'high' when the
+  part is over its allowable stress."
+
 ## 3:20–4:10 — measured savings
 - `python tools/gcode_diff.py baseline.gcode ecoslice.gcode --assert-lighter`
-- The `;ECOSLICE` receipt in the G-code: grams added where physics demanded,
-  grams saved vs blanket-strengthening, gCO₂e with cited constants.
+- The `;ECOSLICE` receipt in the G-code: grams added where physics demanded (split into walls and
+  solid infill), grams saved vs blanket-strengthening, gCO₂e with cited constants — and beneath
+  them the *measured* lines: mass, print time and kWh straight from the slicer's own export footer.
+
+> **Do not skip this shot, and do not fake it.** This round-trip has not been run yet. If the
+> optimized slice comes out heavier than baseline, say so on camera and show the receipt's
+> modelled-vs-measured split — the honest framing is "strength placed where physics asks, at a
+> stated material cost", not an unproven savings number. See *Scope* in the README.
 
 ## 4:10–5:00 — scale & close
 - Extrapolation slide: "If every desktop print strengthened like this instead of blanketing…"
   (top-100 Printables re-slice = stretch goal).
 - Close on theme: *Earth Forward* — every gram intentional.
 
-## Backup if the nightly gate slips
-Record the offline demo end-to-end (`tools/offline_demo.py`) + mock-host mutation walkthrough +
-test suite run. Honest label: slicer-integration pending day-1 gate; all analysis verified.
+## Backup if the live slice will not cooperate
+The day-1 gate already passed (2026-08-26, nightly 2.5.0-dev — see `docs/SPIKE.md`), so the
+fallback is only about the *recording*, not the capability. Record the offline demo end to end
+(`tools/offline_demo.py --options`) + the mock-host mutation walkthrough + the test suite run.
+Honest label: mutation verified live on a nightly; this footage is the offline driver.
