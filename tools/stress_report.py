@@ -231,18 +231,45 @@ def _options_table(analysis) -> str:
     return f'<table class="data"><thead>{head}</thead><tbody>{"".join(rows)}</tbody></table>'
 
 
-def _band_table(analysis) -> str:
-    """The table view the contrast relief rule requires — and the honest detail."""
+BAND_TABLE_MAX_ROWS = 16
+
+
+def _band_row(a) -> str:
+    return (
+        f"<tr><td>{a.z0_mm:.2f} – {a.z1_mm:.2f}</td><td>{a.mean_utilization:.3f}</td>"
+        f"<td>{a.p95_utilization:.3f}</td><td>{int(a.reinforce_xy.sum())}</td>"
+        f"<td>{int(a.relax_xy.sum())}</td></tr>"
+    )
+
+
+def _band_table(analysis, max_rows: int = BAND_TABLE_MAX_ROWS) -> str:
+    """The table view the contrast relief rule requires — and the honest detail.
+
+    A tall part slices into dozens of bands, most of them idle and identical, so
+    the middle is elided rather than pushing the rest of the report off the page.
+    The head is kept longer than the tail because the interesting bands cluster at
+    the build plate, where a part is usually held.
+    """
     head = (
         "<tr><th>z range (mm)</th><th>mean util</th><th>p95 util</th>"
         "<th>reinforced columns</th><th>relaxed columns</th></tr>"
     )
-    rows = "".join(
-        f"<tr><td>{a.z0_mm:.2f} – {a.z1_mm:.2f}</td><td>{a.mean_utilization:.3f}</td>"
-        f"<td>{a.p95_utilization:.3f}</td><td>{int(a.reinforce_xy.sum())}</td>"
-        f"<td>{int(a.relax_xy.sum())}</td></tr>"
-        for a in analysis.plan.actions
-    )
+    actions = analysis.plan.actions
+    if len(actions) <= max_rows:
+        rows = "".join(_band_row(a) for a in actions)
+    else:
+        # max(1, ...) matters: actions[-0:] is the whole list, which would show
+        # every row while claiming to have elided some.
+        keep_tail = max(1, max_rows // 4)
+        keep_head = max(1, max_rows - keep_tail)
+        elided = len(actions) - keep_head - keep_tail
+        rows = "".join(_band_row(a) for a in actions[:keep_head])
+        rows += (
+            f'<tr><td colspan="5" class="muted">… {elided} further bands, '
+            f"between {actions[keep_head].z0_mm:.2f} and "
+            f"{actions[-keep_tail - 1].z1_mm:.2f} mm …</td></tr>"
+        )
+        rows += "".join(_band_row(a) for a in actions[-keep_tail:])
     return f'<table class="data"><thead>{head}</thead><tbody>{rows}</tbody></table>'
 
 

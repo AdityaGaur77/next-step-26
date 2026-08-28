@@ -121,3 +121,34 @@ def test_every_drawn_cell_has_a_hover_tooltip(analysis):
     rects = re.findall(r"<rect [^>]*>", html_text)
     assert rects, "the maps must draw cells"
     assert all("data-tip=" in r for r in rects)
+
+
+def _data_rows(table: str) -> int:
+    """Band rows only — the elision notice is also a <tr><td>."""
+    return len(re.findall(r"<tr><td>[\d.]+ – [\d.]+</td>", table))
+
+
+# The cantilever fixture yields 4 bands; caps below that force the elision path,
+# including the slice arithmetic where a zero-length tail would show everything.
+@pytest.mark.parametrize("max_rows", [2, 3])
+def test_band_table_elides_rather_than_burying_the_report(analysis, max_rows):
+    """A tall part slices into dozens of idle bands. Small caps also exercise the
+    slice arithmetic, where a zero-length tail would silently show every row."""
+    from stress_report import _band_table
+
+    n = len(analysis.plan.actions)
+    assert n > max_rows, "fixture must have more bands than the cap for this to mean anything"
+    table = _band_table(analysis, max_rows=max_rows)
+    rendered = _data_rows(table)
+    assert rendered <= max_rows, f"cap {max_rows} but rendered {rendered}"
+    assert rendered < n, "nothing was actually elided"
+    assert "further bands" in table and "mm …" in table
+
+
+def test_band_table_shows_every_row_when_it_fits(analysis):
+    from stress_report import _band_table
+
+    n = len(analysis.plan.actions)
+    table = _band_table(analysis, max_rows=n + 5)
+    assert table.count("<tr><td>") == n
+    assert "further bands" not in table

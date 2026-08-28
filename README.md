@@ -54,6 +54,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
+| `tools/make_test_part.py` | watertight test STLs sized to actually stress under a realistic load |
 | `tools/verify_gcode.py` | did EcoSlice actually run on this export? names the failure mode |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
 | `docs/` | [running guide](docs/RUNNING.md), architecture, plugin API notes, spike protocol, demo script |
@@ -65,7 +66,7 @@ pip install -e ".[dev]"          # library needs Python ≥3.10; the plugin targ
 python tools/offline_demo.py --resolution 40 --options   # Eco / Balanced / Maximum Strength
 python tools/offline_demo.py --resolution 80 --html proof.html   # visual why-here report
 python tools/offline_demo.py --part bracket --json
-python -m pytest                 # 125 tests: FEM validation, host-binding shapes, bundle checks
+python -m pytest                 # 142 tests: FEM validation, host-binding shapes, bundle checks
 ```
 
 `pytest` works straight from a clone (`pythonpath` is set in `pyproject.toml`); `pyamg` is an
@@ -75,6 +76,8 @@ them; CI covers 3.12 and 3.13.
 
 ## Install into OrcaSlicer (nightly ≥ 2.4.2)
 
+0. `python tools/make_test_part.py --part l-bracket` for a part that will actually show the
+   effect — a cube is too stubby to stress, so the planner correctly does nothing.
 1. Run `python tools/build_plugin.py` (or use the committed bundle). Some CPython 3.12 patch
    releases unparse f-strings in a form no other interpreter emits, which would fail CI's
    staleness gate; the builder probes for that behaviour and refuses to run on such an

@@ -97,6 +97,23 @@ on a different Python (3.11, 3.13, or a current 3.12).
 
 ---
 
+### 1.8 Generate a part to test the slicer with
+
+```bash
+python tools/make_test_part.py --all      # writes cantilever.stl and l-bracket.stl
+```
+
+| part | size | why |
+|---|---|---|
+| `cantilever.stl` | 100 × 10 × 10 mm | the geometry the FEM is validated against; unambiguous root-to-tip gradient |
+| `l-bracket.stl` | 80 mm arms, 5 mm thick, 15 mm deep | a re-entrant corner concentrates stress — the better-looking demo |
+
+**Do not test with a cube.** A cube is short and stubby: stress stays low and uniform, the
+planner correctly decides to reinforce nothing, and that true result is indistinguishable from a
+broken install. Both parts above are sized so a realistic load (6–8 kg) lands near 1.1–1.4×
+allowable, where the plan has real work to do. The stout 10 mm version of the same L sits at
+0.28× and reinforces nothing — the shape alone is not enough.
+
 ## 2. Inside OrcaSlicer
 
 Requires a nightly ≥ 2.4.2. Verified working on `2.5.0-dev` (2026-08-26).
@@ -106,6 +123,8 @@ Requires a nightly ≥ 2.4.2. Verified working on `2.5.0-dev` (2026-08-26).
 
 ### 2.1 Install
 
+0. Generate a part worth testing on first: `python tools/make_test_part.py --part l-bracket`
+   (see 1.8 — a cube will not show you anything).
 1. **Plugins dialog → Local install**, and pick `plugin/ecoslice_core.py`.
 2. **Activate** the plugin with the toggle in the Plugins dialog. Installed is not enabled.
 3. **Select the capability per process profile**: Process settings → **Others** page →
@@ -123,7 +142,7 @@ Plugins dialog → EcoSlice → config. It is a JSON editor:
 
 ```json
 {
-  "description": "shelf bracket holding 8 kg, load downward at the front edge; screwed onto left wall",
+  "description": "wall bracket holding 6 kg, load downward at the free end; screwed onto the left wall",
   "option": "balanced",
   "resolution": 32,
   "add_perimeters": 2,
