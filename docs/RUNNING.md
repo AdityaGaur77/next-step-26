@@ -149,7 +149,25 @@ OrcaSlicer**. Without it the deterministic parser runs, which is fine and reprod
 
 ### 2.3 Confirm it actually ran
 
-Slice a part, then check, in order:
+Point the verifier at the exported file — it names the failure mode instead of leaving you to
+read a receipt by eye:
+
+```bash
+python tools/verify_gcode.py Cube_PLA_34m37s.gcode
+```
+
+It exits 0 only when the plugin ran **and** changed the print, so it can gate a demo checklist.
+The five verdicts:
+
+| verdict | meaning |
+|---|---|
+| `EcoSlice ran and changed the print` | working |
+| `EcoSlice did not run at all` | no markers — capability almost certainly not selected |
+| `That is the spike, not the plugin` | you installed `spike_extra_perimeters.py` |
+| `Analysis ran, but nothing was mutated` | solved fine, `posPrepareInfill` recorded nothing |
+| `The mutation hook ran but changed nothing` | plan landed off the part, or genuinely had nothing to do |
+
+Each verdict prints what it means and what to do about it. To check by hand instead:
 
 1. **Console / log** for `ecoslice` lines — the capability probe, then
    `analyzed obj… maxVM=… allow=… reinforced=… relaxed=…`, then
@@ -158,6 +176,7 @@ Slice a part, then check, in order:
    everywhere.
 3. **Exported G-code** for the `;ECOSLICE BEGIN … ;ECOSLICE END` block.
 
+`verify_gcode.py` reports this case as *the mutation hook ran but changed nothing*.
 **`+0 perimeters added` while the log says `reinforced=2` means the plan is landing off the
 part.** That is the frame-alignment failure described in `docs/PLUGIN_API_NOTES.md`: the mesh
 arrives in plate coordinates while `fill_surfaces` stay in the object-local frame. It is
@@ -178,6 +197,7 @@ ecoslice.gcode    EcoSlice selected
 ```
 
 Same STL, same printer, same filament, same layer height, same infill, same everything else.
+Confirm the second one actually took before diffing: `python tools/verify_gcode.py ecoslice.gcode`.
 Deselecting the capability is the clean toggle — it is what the C++ hook reads. Uninstalling
 the plugin also works but changes more than one variable at a time.
 

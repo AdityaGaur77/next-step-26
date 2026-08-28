@@ -37,6 +37,8 @@
 - Hover a cell: coordinates, utilisation, decision. This is the "why here" answer in one image.
 
 ## 3:40–4:20 — measured savings
+- `python tools/verify_gcode.py ecoslice.gcode` — one command, on camera, proving the plugin
+  really ran inside the slicer rather than the numbers being asserted.
 - `python tools/gcode_diff.py baseline.gcode ecoslice.gcode --assert-lighter`
 - The `;ECOSLICE` receipt in the G-code: grams added where physics demanded (split into walls and
   solid infill), grams saved vs blanket-strengthening, gCO₂e with cited constants — and beneath

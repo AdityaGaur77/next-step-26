@@ -54,6 +54,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
+| `tools/verify_gcode.py` | did EcoSlice actually run on this export? names the failure mode |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
 | `docs/` | [running guide](docs/RUNNING.md), architecture, plugin API notes, spike protocol, demo script |
 
@@ -64,7 +65,7 @@ pip install -e ".[dev]"          # library needs Python ≥3.10; the plugin targ
 python tools/offline_demo.py --resolution 40 --options   # Eco / Balanced / Maximum Strength
 python tools/offline_demo.py --resolution 80 --html proof.html   # visual why-here report
 python tools/offline_demo.py --part bracket --json
-python -m pytest                 # 113 tests: FEM validation, host-binding shapes, bundle checks
+python -m pytest                 # 125 tests: FEM validation, host-binding shapes, bundle checks
 ```
 
 `pytest` works straight from a clone (`pythonpath` is set in `pyproject.toml`); `pyamg` is an
@@ -85,7 +86,8 @@ them; CI covers 3.12 and 3.13.
    profile: Process settings → **Others** → **Slicing Pipeline Plugin** → EcoSlice. The C++ hook
    skips everything while that option is empty, so a plugin that is installed and activated but
    not selected does nothing at all.
-4. Slice a part; check console for `ecoslice` log lines and the G-code for the `;ECOSLICE` block.
+4. Slice a part, then `python tools/verify_gcode.py <exported>.gcode` — it reports whether the
+   plugin ran, whether it changed anything, and what to fix if not.
 5. Optional LLM parsing: `set ANTHROPIC_API_KEY=...` before launching OrcaSlicer;
    otherwise the deterministic heuristic parser is used.
 
