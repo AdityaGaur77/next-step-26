@@ -29,7 +29,14 @@
 - One line: "Same FEM solve, three thresholdings — and the score refuses to say 'high' when the
   part is over its allowable stress."
 
-## 3:20–4:10 — measured savings
+## 3:20–3:40 — the proof, on screen
+- `python tools/offline_demo.py --resolution 80 --html proof.html` and open it.
+- Two elevations side by side: the stress field, then what EcoSlice did about it. On the demo
+  cantilever the reinforcement lands on the top and bottom fibres near the clamped root and the
+  neutral axis is relaxed — textbook bending, straight out of the FEM rather than asserted.
+- Hover a cell: coordinates, utilisation, decision. This is the "why here" answer in one image.
+
+## 3:40–4:20 — measured savings
 - `python tools/gcode_diff.py baseline.gcode ecoslice.gcode --assert-lighter`
 - The `;ECOSLICE` receipt in the G-code: grams added where physics demanded (split into walls and
   solid infill), grams saved vs blanket-strengthening, gCO₂e with cited constants — and beneath
@@ -40,7 +47,7 @@
 > modelled-vs-measured split — the honest framing is "strength placed where physics asks, at a
 > stated material cost", not an unproven savings number. See *Scope* in the README.
 
-## 4:10–5:00 — scale & close
+## 4:20–5:00 — scale & close
 - Extrapolation slide: "If every desktop print strengthened like this instead of blanketing…"
   (top-100 Printables re-slice = stretch goal).
 - Close on theme: *Earth Forward* — every gram intentional.
@@ -48,5 +55,5 @@
 ## Backup if the live slice will not cooperate
 The day-1 gate already passed (2026-08-26, nightly 2.5.0-dev — see `docs/SPIKE.md`), so the
 fallback is only about the *recording*, not the capability. Record the offline demo end to end
-(`tools/offline_demo.py --options`) + the mock-host mutation walkthrough + the test suite run.
+(`tools/offline_demo.py --options --html proof.html`) + the mock-host mutation walkthrough + the test suite run.
 Honest label: mutation verified live on a nightly; this footage is the offline driver.

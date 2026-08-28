@@ -49,10 +49,11 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | path | purpose |
 |---|---|
 | `src/ecoslice/` | library: voxelize, fem, loadcase, mapping, host_bridge, mutate, receipt, options, pipeline |
+| `tools/offline_demo.py` | run the full analysis without OrcaSlicer (`--options`, `--html`, `--json`) |
 | `plugin/ecoslice_core.py` | generated **single-file plugin** (PEP 723) — drop into `orca_plugins/` |
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
-| `tools/offline_demo.py` | run the full analysis without OrcaSlicer (great for the video) |
+| `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
 | `docs/` | architecture, spike protocol, demo script |
 
@@ -61,8 +62,9 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 ```bash
 pip install -e ".[dev]"          # library needs Python ≥3.10; the plugin targets the host's 3.12
 python tools/offline_demo.py --resolution 40 --options   # Eco / Balanced / Maximum Strength
+python tools/offline_demo.py --resolution 80 --html proof.html   # visual why-here report
 python tools/offline_demo.py --part bracket --json
-python -m pytest                 # 101 tests: FEM validation, host-binding shapes, bundle checks
+python -m pytest                 # 113 tests: FEM validation, host-binding shapes, bundle checks
 ```
 
 `pytest` works straight from a clone (`pythonpath` is set in `pyproject.toml`); `pyamg` is an
@@ -111,13 +113,16 @@ discover it in a demo.
 - live mutation of `extra_perimeters` and `fill_surfaces` at `posPrepareInfill` (confirmed on a nightly)
 - Eco / Balanced / Maximum Strength options with a strength-confidence score, from a single solve
 - a `;ECOSLICE` receipt carrying both the model and the slicer's measured footer numbers
+- a standalone HTML proof (`--html`) putting the stress field and the resulting plan side by
+  side, so the reinforcement can be checked against the physics that motivated it
 
 **Not built** — no code for any of these; they are concept, not product:
 
 - adaptive/custom **support generation** (`posSupportMaterial` is not hooked; 3 of 13 steps are)
 - orientation search, overhang maps, thin-feature detection, support-volume analysis
-- any **UI**: no build-plate placement, no 3-D stress heat map, no dashboard
-  (`has_config_ui()` is `False`; configuration is the slicer's JSON editor)
+- **interactive UI inside the slicer**: no build-plate placement, no dashboard, and the proof
+  report is a generated page rather than a live 3-D view (`has_config_ui()` is `False`;
+  configuration is still the slicer's JSON editor)
 - **3MF export** — EcoSlice mutates the live graph and annotates G-code; it writes no 3MF
 - printer / nozzle / material / quality **profiles** (material is three constants in `loadcase.py`)
 - the **hardware node**: accelerometer, thermal camera and filament load-cell loops
