@@ -687,7 +687,7 @@ def region_boundary_length_mm(reinforce_xy: np.ndarray, h: float) -> float:
     return float(dx + dy) * h
 
 def plan_summary_table(plan: Plan, max_rows: int=12) -> str:
-    lines = [f"{'z-range (mm)':>20} {'util mean':>10} {'util p95':>9} {'reinforce':>10} {'relax':>6}"]
+    lines = [f'{'z-range (mm)':>20} {'util mean':>10} {'util p95':>9} {'reinforce':>10} {'relax':>6}']
     rows = plan.actions
     shown = rows if len(rows) <= max_rows else rows[:max_rows // 2] + [None] + rows[-(max_rows // 2):]
     for r in shown:
@@ -1426,19 +1426,19 @@ def _measured_lines(stats: dict) -> list[str]:
     if grams is None and seconds is None:
         return lines
     if grams is not None:
-        lines.append(f";ECOSLICE measured mass   : {_num(grams)} g ({_num(co2e_g(grams), '{:.1f}')} gCO2e virgin PLA)")
+        lines.append(f';ECOSLICE measured mass   : {_num(grams)} g ({_num(co2e_g(grams), '{:.1f}')} gCO2e virgin PLA)')
     if seconds is not None:
         kwh = energy_kwh(seconds / 3600.0)
         lines.append(f';ECOSLICE measured time   : {format_duration(seconds)} = {kwh:.3f} kWh at {PRINTER_WATTS_DEFAULT:.0f} W')
     return lines
 
 def format_receipt(stats: dict) -> list[str]:
-    lines = [RECEIPT_BEGIN, f";ECOSLICE mode            : {stats.get('mode', 'n/a')}", f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}", f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}", f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)", f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa", f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}"]
+    lines = [RECEIPT_BEGIN, f';ECOSLICE mode            : {stats.get('mode', 'n/a')}', f';ECOSLICE load case       : {stats.get('load_case', 'n/a')}', f';ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}', f';ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)', f';ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa', f';ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}']
     if 'confidence' in stats:
-        lines.append(f";ECOSLICE confidence      : {_num(stats.get('confidence'))} ({stats.get('confidence_label', 'n/a')}) - heuristic, not a certification")
+        lines.append(f';ECOSLICE confidence      : {_num(stats.get('confidence'))} ({stats.get('confidence_label', 'n/a')}) - heuristic, not a certification')
         if stats.get('confidence_reasons'):
-            lines.append(f";ECOSLICE confidence why  : {stats['confidence_reasons']}")
-    lines += [_mutation_line(stats, 'reinforced      ', 'reinforced_layers', 'perimeters_added', 'extra perimeter-lines added'), _mutation_line(stats, 'relaxed         ', 'relaxed_layers', 'perimeters_removed', 'perimeter-lines removed'), f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized (walls +{_num(stats.get('added_wall_grams'))} g, solid infill +{_num(stats.get('added_infill_grams'))} g)", f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)"]
+            lines.append(f';ECOSLICE confidence why  : {stats['confidence_reasons']}')
+    lines += [_mutation_line(stats, 'reinforced      ', 'reinforced_layers', 'perimeters_added', 'extra perimeter-lines added'), _mutation_line(stats, 'relaxed         ', 'relaxed_layers', 'perimeters_removed', 'perimeter-lines removed'), f';ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized (walls +{_num(stats.get('added_wall_grams'))} g, solid infill +{_num(stats.get('added_infill_grams'))} g)', f';ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)']
     lines += _measured_lines(stats)
     lines += [';ECOSLICE sources: ' + ' | '.join(CITATIONS), ";ECOSLICE model-vs-measured: the +g / -g lines above are EcoSlice's model; 'measured' lines are the slicer's own export footer", RECEIPT_END]
     return lines
@@ -1626,11 +1626,11 @@ def build_options(grid, von_mises: np.ndarray, *, yield_mpa: float, safety_facto
     return reports
 
 def options_table(reports: list[OptionReport]) -> str:
-    header = f"{'option':<18} {'+g':>7} {'wall':>7} {'infill':>7} {'-g vs blanket':>14} {'+time':>8} {'+kWh':>7} {'conf':>6}"
+    header = f'{'option':<18} {'+g':>7} {'wall':>7} {'infill':>7} {'-g vs blanket':>14} {'+time':>8} {'+kWh':>7} {'conf':>6}'
     lines = [header, '-' * len(header)]
     for r in reports:
         m = r.material
-        lines.append(f"{r.preset.name:<18} {m['added_grams']:>7.2f} {m['added_wall_grams']:>7.2f} {m['added_infill_grams']:>7.2f} {m['saved_vs_uniform_grams']:>14.2f} {m['added_print_time_s'] / 60.0:>7.1f}m {m['added_energy_kwh']:>7.4f} {r.confidence.score:>5.2f} {r.confidence.label}")
+        lines.append(f'{r.preset.name:<18} {m['added_grams']:>7.2f} {m['added_wall_grams']:>7.2f} {m['added_infill_grams']:>7.2f} {m['saved_vs_uniform_grams']:>14.2f} {m['added_print_time_s'] / 60.0:>7.1f}m {m['added_energy_kwh']:>7.4f} {r.confidence.score:>5.2f} {r.confidence.label}')
     return '\n'.join(lines)
 
 # ======================================================================

@@ -4,6 +4,13 @@ import ast
 import sys
 from pathlib import Path
 
+# `ast.unparse` is not stable across interpreter versions: from 3.12 (PEP 701) it
+# emits f-strings that reuse the outer quote inside the expression, which older
+# interpreters cannot even parse. The bundle therefore has ONE supported build
+# interpreter — the one the host runs and the one CI's staleness gate uses.
+# Building on anything older produces a bundle that gate will reject.
+MIN_BUILD_PYTHON = (3, 12)
+
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "ecoslice"
 OUT = ROOT / "plugin" / "ecoslice_core.py"
@@ -273,6 +280,16 @@ def render_imports(entries: list[tuple]) -> str:
 
 
 def main() -> int:
+    if sys.version_info < MIN_BUILD_PYTHON:
+        need = ".".join(str(v) for v in MIN_BUILD_PYTHON)
+        have = ".".join(str(v) for v in sys.version_info[:3])
+        print(
+            f"error: the plugin bundle must be built with Python >= {need} (running {have}).\n"
+            f"       ast.unparse output differs across versions, so a bundle built here would\n"
+            f"       fail CI's staleness gate. Run: python{need} tools/build_plugin.py",
+            file=sys.stderr,
+        )
+        return 2
     local_names = {label for _, label in MODULE_ORDER} | {"ecoslice"}
     bodies = []
     imports: list[str] = []

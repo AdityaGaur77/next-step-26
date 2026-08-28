@@ -76,6 +76,13 @@
    flattens modules into one namespace, preserves `__future__`, and appends a thin adapter
    (`execute(ctx)` dispatch on `ctx.step` — the host calls it for *every* step). Tests import
    the bundle standalone and assert the default config is a dict, as the host requires.
+5b. **One supported build interpreter: Python ≥3.12.** `ast.unparse` is not stable across versions
+   — from 3.12 (PEP 701) it re-quotes f-strings that reuse the outer quote inside the expression,
+   output older interpreters cannot even parse. A bundle built on 3.11 therefore differs byte-wise
+   from one built on 3.12 and fails the CI staleness gate, which pins itself to 3.12. The builder
+   refuses to run below 3.12 rather than emit a bundle that gate will reject, and the bundle-import
+   tests skip below 3.12 while the pure-text checks (PEP 723 header, no intra-package imports) run
+   everywhere.
 6. **Never crash the slicer.** Every hook wraps its body in try/except with logged context.
 
 ## Performance envelope
