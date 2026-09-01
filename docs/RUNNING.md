@@ -21,6 +21,19 @@ pip install -e ".[dev]"
 Python ≥3.10 for the library. CI covers 3.12 and 3.13. `pyamg` is optional
 (`pip install -e ".[amg]"`) and only changes which fallback the FEM solver reaches for.
 
+### 1.1a The short version
+
+If you only read one line of this guide:
+
+```bash
+python tools/demo.py
+```
+
+~10 s, and `./demo/` then holds both test parts, a proof page for each, and
+`RUN-ORDER.txt` — the order to show things in, what to say, and what to fall back to
+if the slicer misbehaves on the day. The rest of this section is the same steps
+individually, for when you want to vary them.
+
 ### 1.2 Run the analysis
 
 ```bash

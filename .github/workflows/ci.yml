@@ -41,4 +41,5 @@ jobs:
           python tools/offline_demo.py --resolution 32 --options
           python tools/offline_demo.py --resolution 24 --html /tmp/ecoslice-report.html
           python tools/make_test_part.py --all
+          python tools/demo.py --out /tmp/ecoslice-demo --only cantilever
           python tools/offline_demo.py --part bracket --resolution 24 --json

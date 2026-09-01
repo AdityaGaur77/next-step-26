@@ -54,6 +54,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
+| `tools/demo.py` | one command: parts + analyses + proof pages + a run-order sheet |
 | `tools/make_test_part.py` | watertight test STLs sized to actually stress under a realistic load |
 | `tools/verify_gcode.py` | did EcoSlice actually run on this export? names the failure mode |
 | `tools/gcode_diff.py` | footer diff + CO₂e math + `--assert-lighter` CI gate |
@@ -63,10 +64,11 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 
 ```bash
 pip install -e ".[dev]"          # library needs Python ≥3.10; the plugin targets the host's 3.12
+python tools/demo.py             # ← everything for a demo, in ./demo/, in ~10 s
 python tools/offline_demo.py --resolution 40 --options   # Eco / Balanced / Maximum Strength
 python tools/offline_demo.py --resolution 80 --html proof.html   # visual why-here report
 python tools/offline_demo.py --part bracket --json
-python -m pytest                 # 142 tests: FEM validation, host-binding shapes, bundle checks
+python -m pytest                 # 147 tests: FEM validation, host-binding shapes, bundle checks
 ```
 
 `pytest` works straight from a clone (`pythonpath` is set in `pyproject.toml`); `pyamg` is an
