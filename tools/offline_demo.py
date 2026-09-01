@@ -6,8 +6,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ecoslice.mapping import plan_summary_table
+from ecoslice.options import options_table
+from stress_report import render_report
 from ecoslice.pipeline import EcoSlicePipeline
 from ecoslice.receipt import receipt_block
 from ecoslice.voxelize import box_mesh, uv_sphere_mesh
@@ -43,12 +46,20 @@ def main(argv=None) -> int:
     ap.add_argument("--part", choices=list(PART_BUILDERS), default="cantilever")
     ap.add_argument("--resolution", type=int, default=48)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--options", action="store_true", help="show the Eco / Balanced / Maximum Strength table")
+    ap.add_argument("--html", metavar="PATH", help="write a visual stress/decision report to PATH")
     args = ap.parse_args(argv)
 
     desc = DESCRIPTIONS[args.part]
     pipe = EcoSlicePipeline(description=desc, resolution=args.resolution, layer_height_mm=0.2)
     v, t = PART_BUILDERS[args.part]()
     analysis = pipe.analyze_mesh(v, t, desc, "demo")
+
+    if args.json and args.html:
+        Path(args.html).write_text(
+            render_report(analysis, args.part, receipt_block(analysis.stats(pipe.cfg))),
+            encoding="utf-8",
+        )
 
     if args.json:
         print(
@@ -63,6 +74,8 @@ def main(argv=None) -> int:
                     "solver": analysis.fem.solver,
                     "wall_seconds": round(analysis.wall_seconds, 2),
                     "savings": analysis.savings,
+                    "confidence": analysis.confidence.as_dict() if analysis.confidence else None,
+                    "options": [o.as_dict() for o in analysis.options],
                 },
                 indent=2,
             )
@@ -83,10 +96,22 @@ def main(argv=None) -> int:
           f"{analysis.plan.allowable_mpa:.1f} MPa (yield/sf)")
     disp = list(analysis.fem.face_displacement.values())[0]
     print(f"load-face defl: {abs(disp):.2f} mm")
+    if analysis.confidence is not None:
+        c = analysis.confidence
+        print(f"confidence    : {c.score:.2f} ({c.label}) - {'; '.join(c.reasons)}")
     print()
     print(plan_summary_table(analysis.plan))
+    if args.options:
+        print()
+        print("Options (one FEM solve, three thresholdings):")
+        print(options_table(analysis.options))
     print()
-    print(receipt_block(analysis.stats(pipe.cfg)))
+    receipt = receipt_block(analysis.stats(pipe.cfg))
+    print(receipt)
+    if args.html:
+        out = Path(args.html)
+        out.write_text(render_report(analysis, args.part, receipt), encoding="utf-8")
+        print(f"wrote {out} ({out.stat().st_size / 1024:.0f} KB)")
     return 0
 
 

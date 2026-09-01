@@ -609,6 +609,7 @@ class LayerAction:
     p95_utilization: float
     n_voxels: int
     median_utilization: float = 0.0
+    occupied_xy: np.ndarray | None = None
 
 @dataclass
 class Plan:
@@ -653,6 +654,7 @@ def plan_from_stress(grid, von_mises: np.ndarray, *, yield_mpa: float, safety_fa
         p95_u = float(np.percentile(vals, 95))
         col_hot = (uband >= reinforce_frac).any(axis=2)
         col_cold = (uband <= relax_frac).all(axis=2)
+        col_occupied = band.any(axis=2)
         hot_count = int(col_hot.sum())
         if mean_u >= reinforce_frac or (p95_u >= hotspot_frac and hot_count >= min_reinforce_columns_per_layer):
             reinforce = col_hot
@@ -665,7 +667,7 @@ def plan_from_stress(grid, von_mises: np.ndarray, *, yield_mpa: float, safety_fa
             relax = np.zeros_like(col_hot)
         z0 = grid.origin[2] + k * h
         z1 = grid.origin[2] + k_end * h
-        action = LayerAction(z0_mm=float(z0), z1_mm=float(z1), reinforce_xy=reinforce, relax_xy=relax, mean_utilization=mean_u, p95_utilization=p95_u, n_voxels=n_vox, median_utilization=med_u)
+        action = LayerAction(z0_mm=float(z0), z1_mm=float(z1), reinforce_xy=reinforce, relax_xy=relax, mean_utilization=mean_u, p95_utilization=p95_u, n_voxels=n_vox, median_utilization=med_u, occupied_xy=col_occupied)
         plan.actions.append(action)
         if reinforce.any():
             plan.n_reinforced_layers += 1
@@ -704,6 +706,8 @@ log = logging.getLogger('ecoslice.host')
 SCALED_UNITS_PER_MM = 1000000.0
 SCALE_GUESSES = (1000000.0, 1000.0, 1.0)
 SOLID_ENUM_NAMES = ('stInternalSolid', 'stSolid', 'InternalSolid')
+SPARSE_ENUM_NAMES = ('stInternal', 'Internal')
+DOWNGRADABLE_ENUM_NAMES = ('stInternalSolid',)
 SOLID_TYPE_NAMES = ('internal_solid', 'internalsolid', 'solid', 'stinternalsolid')
 SPARSE_HINTS = ('internal', 'sparse', 'infill')
 
@@ -1040,6 +1044,48 @@ def solid_surface_type(surface, fallback: str='internal_solid'):
             return member
     return fallback
 
+def sparse_surface_type(surface, fallback: str='internal'):
+    """The value meaning ordinary sparse internal infill, resolved like `solid_surface_type`."""
+    current = get_surface_type(surface)
+    if current is None or isinstance(current, str):
+        return fallback
+    cls = type(current)
+    for name in SPARSE_ENUM_NAMES:
+        member = getattr(cls, name, None)
+        if member is not None:
+            return member
+    return fallback
+
+def is_downgradable_solid(surface) -> bool:
+    """True only for density-driven internal solid infill (`stInternalSolid`).
+
+    Top, bottom and every bridge variant are load-bearing or visible shells that
+    the slicer created for a reason, so they are never candidates for being
+    thinned back out to sparse — only the internal solid the shell-thickness
+    logic added is.
+    """
+    st = get_surface_type(surface)
+    if st is None:
+        return False
+    if isinstance(st, str):
+        return st.strip().lower().replace('_', '') in ('internalsolid', 'stinternalsolid')
+    name = getattr(st, 'name', None) or str(st).rsplit('.', 1)[-1]
+    return name in DOWNGRADABLE_ENUM_NAMES
+
+def set_surface_sparse(surface) -> bool:
+    """Reclassify a solid internal surface back to sparse infill."""
+    if not is_downgradable_solid(surface):
+        return False
+    value = sparse_surface_type(surface)
+    for attr in ('surface_type', 'type_'):
+        if hasattr(surface, attr):
+            try:
+                setattr(surface, attr, value)
+                return True
+            except Exception as exc:
+                log.debug('set_surface_sparse failed on %r: %s', attr, exc)
+    return False
+
 def set_surface_type(surface, solid_type=None) -> bool:
     value = solid_type
     if value is None or isinstance(value, str):
@@ -1115,12 +1161,14 @@ class MutationConfig:
     enable_solid_infill: bool = True
     enable_relax: bool = True
     solid_type: str = 'internal_solid'
+    enable_solid_downgrade: bool = False
 
 @dataclass
 class MutationStats:
     surfaces_reinforced: int = 0
     surfaces_solidified: int = 0
     surfaces_relaxed: int = 0
+    surfaces_desolidified: int = 0
     surfaces_skipped_no_xy: int = 0
     perimeters_added: int = 0
     perimeters_removed: int = 0
@@ -1129,6 +1177,7 @@ class MutationStats:
         self.surfaces_reinforced += other.surfaces_reinforced
         self.surfaces_solidified += other.surfaces_solidified
         self.surfaces_relaxed += other.surfaces_relaxed
+        self.surfaces_desolidified += other.surfaces_desolidified
         self.surfaces_skipped_no_xy += other.surfaces_skipped_no_xy
         self.perimeters_added += other.perimeters_added
         self.perimeters_removed += other.perimeters_removed
@@ -1248,6 +1297,9 @@ def apply_to_region(region, action: LayerAction, grid, cfg: MutationConfig, alig
             if cur > 0 and set_extra_perimeters(surface, 0):
                 stats.surfaces_relaxed += 1
                 stats.perimeters_removed += cur
+            if cfg.enable_solid_downgrade and is_downgradable_solid(surface):
+                if set_surface_sparse(surface):
+                    stats.surfaces_desolidified += 1
     return stats
 
 def apply_plan_to_object(print_object, plan, grid, cfg: MutationConfig, alignment: FrameAlignment | None=None) -> MutationStats:
@@ -1286,6 +1338,56 @@ def co2e_g(grams_filament: float, recycled: bool=False) -> float:
 
 def energy_kwh(print_hours: float, watts: float=PRINTER_WATTS_DEFAULT) -> float:
     return print_hours * watts / 1000.0
+FILAMENT_G_RE = re.compile(';\\s*filament used \\[g\\]\\s*[:=]?\\s*([\\d.,]+)', re.IGNORECASE)
+FILAMENT_CM3_RE = re.compile(';\\s*filament used \\[cm3\\]\\s*[:=]?\\s*([\\d.,]+)', re.IGNORECASE)
+PRINT_TIME_RE = re.compile(';\\s*estimated printing time \\(normal mode\\)\\s*[:=]?\\s*(.+)', re.IGNORECASE)
+_TIME_UNITS_RE = re.compile('(?:(\\d+)\\s*d)?\\s*(?:(\\d+)\\s*h)?\\s*(?:(\\d+)\\s*m)?\\s*(?:(\\d+(?:\\.\\d+)?)\\s*s)?', re.IGNORECASE)
+
+def parse_duration_seconds(text: str) -> float | None:
+    """Seconds from an OrcaSlicer/PrusaSlicer duration footer ("1h 54m 12s")."""
+    m = _TIME_UNITS_RE.match(text.strip())
+    if not m or not any(m.groups()):
+        return None
+    d, h, mi, sec = (float(x) if x else 0.0 for x in m.groups())
+    return d * 86400.0 + h * 3600.0 + mi * 60.0 + sec
+
+def parse_gcode_footer(gcode_text: str) -> dict:
+    """Authoritative filament/time numbers straight out of the exported G-code.
+
+    These are the slicer's own totals for the print EcoSlice just shaped, so the
+    receipt can quote measured mass, time and energy instead of only a model.
+    Our own ``;ECOSLICE`` lines are skipped so a re-run never reads its own output.
+    """
+    out: dict = {'filament_g': None, 'filament_cm3': None, 'print_time_s': None}
+    for line in gcode_text.splitlines():
+        line = line.strip()
+        if not line.startswith(';') or line.startswith(';ECOSLICE'):
+            continue
+        if out['filament_g'] is None:
+            m = FILAMENT_G_RE.match(line)
+            if m:
+                out['filament_g'] = float(m.group(1).replace(',', '.'))
+                continue
+        if out['filament_cm3'] is None:
+            m = FILAMENT_CM3_RE.match(line)
+            if m:
+                out['filament_cm3'] = float(m.group(1).replace(',', '.'))
+                continue
+        if out['print_time_s'] is None:
+            m = PRINT_TIME_RE.match(line)
+            if m:
+                out['print_time_s'] = parse_duration_seconds(m.group(1))
+    return out
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h, rem = divmod(int(round(seconds)), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f'{h}h{m:02d}m'
+    if m:
+        return f'{m}m{s:02d}s'
+    return f'{s}s'
 
 @dataclass
 class SavingsEstimate:
@@ -1312,12 +1414,224 @@ def _mutation_line(stats: dict, label: str, layers_key: str, count_key: str, nou
 RECEIPT_BEGIN = ';ECOSLICE BEGIN ----------------------------------------------------------'
 RECEIPT_END = ';ECOSLICE END ------------------------------------------------------------'
 
+def _measured_lines(stats: dict) -> list[str]:
+    """Lines quoting the slicer's own export footer, when the receipt has it.
+
+    Everything above these lines is EcoSlice's model of the print; these are what
+    the print actually costs, so they are labelled measured and kept separate.
+    """
+    lines: list[str] = []
+    grams = stats.get('measured_filament_g')
+    seconds = stats.get('measured_print_time_s')
+    if grams is None and seconds is None:
+        return lines
+    if grams is not None:
+        lines.append(f";ECOSLICE measured mass   : {_num(grams)} g ({_num(co2e_g(grams), '{:.1f}')} gCO2e virgin PLA)")
+    if seconds is not None:
+        kwh = energy_kwh(seconds / 3600.0)
+        lines.append(f';ECOSLICE measured time   : {format_duration(seconds)} = {kwh:.3f} kWh at {PRINTER_WATTS_DEFAULT:.0f} W')
+    return lines
+
 def format_receipt(stats: dict) -> list[str]:
-    lines = [RECEIPT_BEGIN, f";ECOSLICE mode            : {stats.get('mode', 'n/a')}", f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}", f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}", f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)", f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa", f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}", _mutation_line(stats, 'reinforced      ', 'reinforced_layers', 'perimeters_added', 'extra perimeter-lines added'), _mutation_line(stats, 'relaxed         ', 'relaxed_layers', 'perimeters_removed', 'perimeter-lines removed'), f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized", f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)", ';ECOSLICE sources: ' + ' | '.join(CITATIONS), ';ECOSLICE estimate-only   : true (authoritative numbers come from G-code footers)', RECEIPT_END]
+    lines = [RECEIPT_BEGIN, f";ECOSLICE mode            : {stats.get('mode', 'n/a')}", f";ECOSLICE load case       : {stats.get('load_case', 'n/a')}", f";ECOSLICE safety factor   : {_num(stats.get('safety_factor'))}", f";ECOSLICE allowable stress: {_num(stats.get('allowable_mpa'), '{:.1f}')} MPa (yield/sf)", f";ECOSLICE max von Mises   : {_num(stats.get('max_vm_mpa'), '{:.1f}')} MPa", f";ECOSLICE solver          : {stats.get('solver', 'n/a')} | voxels {stats.get('voxels', 'n/a')}"]
+    if 'confidence' in stats:
+        lines.append(f";ECOSLICE confidence      : {_num(stats.get('confidence'))} ({stats.get('confidence_label', 'n/a')}) - heuristic, not a certification")
+        if stats.get('confidence_reasons'):
+            lines.append(f";ECOSLICE confidence why  : {stats['confidence_reasons']}")
+    lines += [_mutation_line(stats, 'reinforced      ', 'reinforced_layers', 'perimeters_added', 'extra perimeter-lines added'), _mutation_line(stats, 'relaxed         ', 'relaxed_layers', 'perimeters_removed', 'perimeter-lines removed'), f";ECOSLICE reinforcement   : +{_num(stats.get('added_grams'))} g localized (walls +{_num(stats.get('added_wall_grams'))} g, solid infill +{_num(stats.get('added_infill_grams'))} g)", f";ECOSLICE vs blanket-strengthened baseline: -{_num(stats.get('saved_vs_uniform_grams'))} g (-{_num(stats.get('co2e_saved_vs_uniform_g'), '{:.1f}')} gCO2e virgin PLA)"]
+    lines += _measured_lines(stats)
+    lines += [';ECOSLICE sources: ' + ' | '.join(CITATIONS), ";ECOSLICE model-vs-measured: the +g / -g lines above are EcoSlice's model; 'measured' lines are the slicer's own export footer", RECEIPT_END]
     return lines
 
 def receipt_block(stats: dict) -> str:
     return '\n'.join(format_receipt(stats)) + '\n'
+
+# ======================================================================
+# module: options
+# ======================================================================
+DEFAULT_LINE_WIDTH_MM = 0.42
+DEFAULT_SPARSE_INFILL_DENSITY = 0.15
+NOMINAL_FLOW_MM3_S = 8.0
+CONFIDENCE_LABELS = ((0.75, 'high'), (0.5, 'moderate'), (0.0, 'low'))
+OVER_ALLOWABLE_SCORE_CAP = 0.6
+
+@dataclass
+class Confidence:
+    """Heuristic trust score for a plan — explicitly not an engineering certification."""
+    score: float
+    label: str
+    reasons: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {'confidence': round(self.score, 2), 'confidence_label': self.label, 'confidence_reasons': '; '.join(self.reasons)}
+
+def _label_for(score: float) -> str:
+    for threshold, label in CONFIDENCE_LABELS:
+        if score >= threshold:
+            return label
+    return 'low'
+
+def strength_confidence(plan: Plan, grid, von_mises: np.ndarray, at_risk_frac: float=1.0) -> Confidence:
+    """Blend stress margin, hotspot coverage and mesh adequacy into one 0-1 score.
+
+    Three things can make a plan untrustworthy and each is scored separately so
+    the receipt can say *which* one is weak: the part may be over its allowable
+    stress however it is reinforced, the reinforcement may miss hotspots, or the
+    voxel grid may be too coarse through the thin direction to resolve bending
+    at all.
+
+    Coverage is measured against voxels *at or over* the allowable stress, not
+    against the planner's lower reinforce threshold: a part comfortably inside
+    its margin has nothing at risk, and must not be marked down for the planner
+    correctly deciding it needs no extra material.
+    """
+    reasons: list[str] = []
+    allowable = plan.allowable_mpa or 1e-09
+    util_max = float(plan.max_vm_mpa) / allowable
+    over_allowable = util_max > 1.0
+    if util_max <= 0.8:
+        margin = 1.0
+        reasons.append(f'peak stress {util_max:.2f}x allowable - inside margin')
+    elif util_max <= 1.0:
+        margin = float(1.0 - 0.4 * (util_max - 0.8) / 0.2)
+        reasons.append(f'peak stress {util_max:.2f}x allowable - close to the limit')
+    elif util_max >= 2.0:
+        margin = 0.0
+        reasons.append(f'peak stress {util_max:.2f}x allowable - part is under-sized, not a wall problem')
+    else:
+        margin = float(0.6 * (2.0 - util_max))
+        reasons.append(f'peak stress {util_max:.2f}x allowable - OVER the allowable, reinforcement alone will not fix this')
+    hot_total = 0
+    hot_covered = 0
+    h = grid.h
+    origin_z = float(grid.origin[2])
+    util = np.zeros_like(von_mises)
+    occ = grid.mask & (von_mises > 0)
+    util[occ] = von_mises[occ] / allowable
+    for action in plan.actions:
+        k0 = int(round((action.z0_mm - origin_z) / h))
+        k1 = int(round((action.z1_mm - origin_z) / h))
+        band = util[:, :, k0:k1]
+        if band.size == 0:
+            continue
+        hot = band >= at_risk_frac
+        n_hot = int(hot.sum())
+        if n_hot == 0:
+            continue
+        hot_total += n_hot
+        hot_covered += int((hot & action.reinforce_xy[:, :, None]).sum())
+    if hot_total == 0:
+        coverage = 1.0
+        reasons.append('no voxel reaches the allowable stress - nothing at risk')
+    else:
+        coverage = hot_covered / hot_total
+        reasons.append(f'{coverage * 100:.0f}% of at-risk voxels sit under reinforced columns')
+    cells_across = int(min(grid.shape))
+    if cells_across >= 8:
+        mesh = 1.0
+    elif cells_across >= 4:
+        mesh = 0.5 + 0.5 * (cells_across - 4) / 4.0
+    else:
+        mesh = 0.25
+        reasons.append(f'only {cells_across} cells across the thinnest axis - bending is under-resolved')
+    if cells_across >= 8:
+        reasons.append(f'{cells_across} cells across the thinnest axis')
+    elif cells_across >= 4:
+        reasons.append(f'{cells_across} cells across the thinnest axis - coarse for bending')
+    score = 0.45 * margin + 0.35 * coverage + 0.2 * mesh
+    if over_allowable:
+        score = min(score, OVER_ALLOWABLE_SCORE_CAP)
+    score = float(min(max(score, 0.0), 1.0))
+    return Confidence(score=score, label=_label_for(score), reasons=reasons)
+
+def estimate_material(plan: Plan, grid, *, add_perimeters: int, layer_height_mm: float, enable_solid_infill: bool=True, infill_density: float=DEFAULT_SPARSE_INFILL_DENSITY, line_width_mm: float=DEFAULT_LINE_WIDTH_MM) -> dict:
+    """Material a plan adds, split into wall lines and solid-infill fill-in.
+
+    Both levers are counted: extra perimeters trace the *boundary* of each
+    reinforced region, while reclassifying sparse infill to solid fills its
+    *area* from the profile's sparse density up to 100%. The solid term is
+    usually the larger of the two, which is why it cannot be left out.
+
+    The "uniform" figure is the same treatment applied to the whole occupied
+    footprint of every band — the blanket-strengthening baseline the savings
+    claim is measured against.
+    """
+    lh = layer_height_mm if layer_height_mm and layer_height_mm > 0 else 0.2
+    h = grid.h
+    fill_fraction = max(0.0, 1.0 - float(infill_density)) if enable_solid_infill else 0.0
+    wall_vol = uniform_wall_vol = 0.0
+    infill_vol = uniform_infill_vol = 0.0
+    cell_area = h * h
+    for a in plan.actions:
+        n_print_layers = max(1, int(round((a.z1_mm - a.z0_mm) / lh)))
+        occupied = a.occupied_xy if a.occupied_xy is not None else np.ones_like(a.reinforce_xy)
+        hot_len = region_boundary_length_mm(a.reinforce_xy, h)
+        all_len = region_boundary_length_mm(occupied, h)
+        wall_vol += hot_len * add_perimeters * line_width_mm * lh * n_print_layers
+        uniform_wall_vol += all_len * add_perimeters * line_width_mm * lh * n_print_layers
+        hot_area = float(a.reinforce_xy.sum()) * cell_area
+        all_area = float(occupied.sum()) * cell_area
+        infill_vol += hot_area * fill_fraction * lh * n_print_layers
+        uniform_infill_vol += all_area * fill_fraction * lh * n_print_layers
+    added_wall_g = grams_from_volume_mm3(wall_vol)
+    added_infill_g = grams_from_volume_mm3(infill_vol)
+    added_g = added_wall_g + added_infill_g
+    uniform_g = grams_from_volume_mm3(uniform_wall_vol + uniform_infill_vol)
+    saved = max(uniform_g - added_g, 0.0)
+    added_volume = wall_vol + infill_vol
+    added_time_s = added_volume / NOMINAL_FLOW_MM3_S if NOMINAL_FLOW_MM3_S > 0 else 0.0
+    return {'added_wall_grams': round(added_wall_g, 3), 'added_infill_grams': round(added_infill_g, 3), 'added_grams': round(added_g, 3), 'uniform_baseline_grams': round(uniform_g, 3), 'saved_vs_uniform_grams': round(saved, 3), 'co2e_saved_vs_uniform_g': round(co2e_g(saved), 2), 'added_co2e_g': round(co2e_g(added_g), 2), 'added_print_time_s': round(added_time_s, 1), 'added_energy_kwh': round(energy_kwh(added_time_s / 3600.0), 4)}
+
+@dataclass(frozen=True)
+class OptionPreset:
+    """One of the three transparent choices offered for a part."""
+    key: str
+    name: str
+    blurb: str
+    add_perimeters: int
+    max_extra_perimeters: int
+    enable_solid_infill: bool
+    enable_relax: bool
+    reinforce_frac: float
+    relax_frac: float
+PRESETS: tuple[OptionPreset, ...] = (OptionPreset(key='eco', name='Eco', blurb='reinforce only true hotspots, relax aggressively elsewhere', add_perimeters=1, max_extra_perimeters=2, enable_solid_infill=False, enable_relax=True, reinforce_frac=0.8, relax_frac=0.35), OptionPreset(key='balanced', name='Balanced', blurb='walls and solid infill where stress demands, relax cold bands', add_perimeters=2, max_extra_perimeters=4, enable_solid_infill=True, enable_relax=True, reinforce_frac=0.6, relax_frac=0.2), OptionPreset(key='max_strength', name='Maximum Strength', blurb='widen the reinforced zone, no relaxation anywhere', add_perimeters=3, max_extra_perimeters=6, enable_solid_infill=True, enable_relax=False, reinforce_frac=0.4, relax_frac=0.0))
+PRESETS_BY_KEY = {p.key: p for p in PRESETS}
+
+@dataclass
+class OptionReport:
+    preset: OptionPreset
+    plan: Plan
+    confidence: Confidence
+    material: dict
+
+    def as_dict(self) -> dict:
+        d = {'key': self.preset.key, 'name': self.preset.name, 'blurb': self.preset.blurb, 'reinforced_layers': self.plan.n_reinforced_layers, 'relaxed_layers': self.plan.n_relaxed_layers}
+        d.update(self.material)
+        d.update(self.confidence.as_dict())
+        return d
+
+def build_options(grid, von_mises: np.ndarray, *, yield_mpa: float, safety_factor: float, layer_height_mm: float | None=None, infill_density: float=DEFAULT_SPARSE_INFILL_DENSITY, presets: tuple[OptionPreset, ...]=PRESETS) -> list[OptionReport]:
+    """Eco / Balanced / Maximum Strength from a single FEM solve.
+
+    Only the plan thresholds and mutation strength change between options, so the
+    stress field is solved once and re-thresholded — three options cost three
+    cheap passes over the von Mises field, not three solves.
+    """
+    reports: list[OptionReport] = []
+    for preset in presets:
+        plan = plan_from_stress(grid, von_mises, yield_mpa=yield_mpa, safety_factor=safety_factor, layer_height_mm=layer_height_mm, reinforce_frac=preset.reinforce_frac, relax_frac=preset.relax_frac)
+        material = estimate_material(plan, grid, add_perimeters=preset.add_perimeters, layer_height_mm=layer_height_mm or 0.2, enable_solid_infill=preset.enable_solid_infill, infill_density=infill_density)
+        confidence = strength_confidence(plan, grid, von_mises)
+        reports.append(OptionReport(preset=preset, plan=plan, confidence=confidence, material=material))
+    return reports
+
+def options_table(reports: list[OptionReport]) -> str:
+    header = f"{'option':<18} {'+g':>7} {'wall':>7} {'infill':>7} {'-g vs blanket':>14} {'+time':>8} {'+kWh':>7} {'conf':>6}"
+    lines = [header, '-' * len(header)]
+    for r in reports:
+        m = r.material
+        lines.append(f"{r.preset.name:<18} {m['added_grams']:>7.2f} {m['added_wall_grams']:>7.2f} {m['added_infill_grams']:>7.2f} {m['saved_vs_uniform_grams']:>14.2f} {m['added_print_time_s'] / 60.0:>7.1f}m {m['added_energy_kwh']:>7.4f} {r.confidence.score:>5.2f} {r.confidence.label}")
+    return '\n'.join(lines)
 
 # ======================================================================
 # module: pipeline
@@ -1336,26 +1650,32 @@ class Analysis:
     wall_seconds: float
     savings: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    confidence: Confidence | None = None
+    options: list[OptionReport] = field(default_factory=list)
 
     def stats(self, cfg: MutationConfig, mutation: MutationStats | None=None) -> dict:
         d = {'mode': 'load-aware walls & infill', 'load_case': self.load_case.description[:60] or '(unnamed)', 'load_case_source': self.load_case.source, 'safety_factor': self.load_case.safety_factor, 'allowable_mpa': self.plan.allowable_mpa, 'max_vm_mpa': self.plan.max_vm_mpa, 'solver': f'{self.fem.solver} @ {self.fem.n_dof} dof', 'voxels': f'{self.grid.shape[0]}x{self.grid.shape[1]}x{self.grid.shape[2]}', 'reinforced_layers': self.plan.n_reinforced_layers, 'relaxed_layers': self.plan.n_relaxed_layers, 'analysis_seconds': round(self.wall_seconds, 2)}
+        if self.confidence is not None:
+            d.update(self.confidence.as_dict())
         if self.notes:
             d['notes'] = '; '.join(self.notes)
         if mutation is not None:
             d['perimeters_added'] = mutation.perimeters_added
             d['perimeters_removed'] = mutation.perimeters_removed
             d['surfaces_solidified'] = mutation.surfaces_solidified
+            d['surfaces_desolidified'] = mutation.surfaces_desolidified
         d.update(self.savings)
         return d
 
 class EcoSlicePipeline:
 
-    def __init__(self, cfg: MutationConfig | None=None, description: str | None=None, load_case: LoadCase | None=None, resolution: int=DEFAULT_RESOLUTION, layer_height_mm: float | None=None):
+    def __init__(self, cfg: MutationConfig | None=None, description: str | None=None, load_case: LoadCase | None=None, resolution: int=DEFAULT_RESOLUTION, layer_height_mm: float | None=None, infill_density: float=DEFAULT_SPARSE_INFILL_DENSITY):
         self.cfg = cfg or MutationConfig()
         self.description = description or ''
         self._explicit_load_case = load_case
         self.resolution = resolution
         self.layer_height_mm = layer_height_mm
+        self.infill_density = infill_density
         self.analyses: dict[str, Analysis] = {}
         self.capabilities: HostCapabilities | None = None
         self._last_mutation: MutationStats | None = None
@@ -1406,26 +1726,14 @@ class EcoSlicePipeline:
         fem = solve_voxel_fem(grid, fixed_faces=constraint_faces, load_face=load_face, load_vector_n=total_force, young_modulus_mpa=lc.young_modulus_mpa, poisson=lc.poisson)
         plan = plan_from_stress(grid, fem.von_mises, yield_mpa=lc.yield_mpa, safety_factor=lc.safety_factor, layer_height_mm=self.layer_height_mm)
         analysis = Analysis(object_key=object_id, load_case=lc, grid=grid, fem=fem, plan=plan, wall_seconds=time.perf_counter() - t0, notes=notes)
+        analysis.confidence = strength_confidence(plan, grid, fem.von_mises)
         analysis.savings = self._estimate_savings(plan, grid)
+        analysis.options = build_options(grid, fem.von_mises, yield_mpa=lc.yield_mpa, safety_factor=lc.safety_factor, layer_height_mm=self.layer_height_mm, infill_density=self.infill_density)
         self.analyses[object_id] = analysis
         return analysis
 
     def _estimate_savings(self, plan: Plan, grid) -> dict:
-        line_width = 0.42
-        lh = self.layer_height_mm or 0.2
-        h = grid.h
-        added_vol = 0.0
-        uniform_vol = 0.0
-        for a in plan.actions:
-            n_print_layers = max(1, int(round((a.z1_mm - a.z0_mm) / lh)))
-            hot_len = region_boundary_length_mm(a.reinforce_xy, h)
-            all_len = region_boundary_length_mm(np.ones_like(a.reinforce_xy), h)
-            added_vol += hot_len * self.cfg.add_perimeters * line_width * lh * n_print_layers
-            uniform_vol += all_len * self.cfg.add_perimeters * line_width * lh * n_print_layers
-        added_g = grams_from_volume_mm3(added_vol)
-        uniform_g = grams_from_volume_mm3(uniform_vol)
-        saved = max(uniform_g - added_g, 0.0)
-        return {'added_grams': round(added_g, 3), 'uniform_baseline_grams': round(uniform_g, 3), 'saved_vs_uniform_grams': round(saved, 3), 'co2e_saved_vs_uniform_g': round(co2e_g(saved), 2)}
+        return estimate_material(plan, grid, add_perimeters=self.cfg.add_perimeters, layer_height_mm=self.layer_height_mm or 0.2, enable_solid_infill=self.cfg.enable_solid_infill, infill_density=self.infill_density)
 
     def run_offline(self, vertices, triangles, description: str, object_id: str='obj') -> Analysis:
         return self.analyze_mesh(vertices, triangles, description, object_id)
@@ -1465,6 +1773,11 @@ class EcoSlicePipeline:
                 log.info('host capabilities: %s', self.capabilities.as_dict())
             if self.layer_height_mm is None:
                 self.layer_height_mm = _config_float(ctx, 'layer_height')
+            density = _config_float(ctx, 'sparse_infill_density')
+            if density is None:
+                density = _config_float(ctx, 'fill_density')
+            if density is not None and 0.0 <= density <= 100.0:
+                self.infill_density = density / 100.0 if density > 1.0 else density
             for obj in iter_print_objects(ctx):
                 if object_key(obj) in self.analyses:
                     continue
@@ -1490,7 +1803,9 @@ class EcoSlicePipeline:
 
     def on_gcode_postprocess(self, gcode_text: str) -> str:
         try:
-            block = receipt_block(self._aggregate_stats())
+            stats = self._aggregate_stats()
+            stats.update(self._measured_stats(gcode_text))
+            block = receipt_block(stats)
             lines = [ln for ln in gcode_text.splitlines() if not ln.startswith(';ECOSLICE')]
             insert_at = 0
             for i, ln in enumerate(lines[:50]):
@@ -1501,6 +1816,25 @@ class EcoSlicePipeline:
         except Exception as exc:
             log.exception('postprocess hook failed (non-fatal): %s', exc)
             return gcode_text
+
+    def _measured_stats(self, gcode_text: str) -> dict:
+        """Filament mass and print time as the slicer itself reported them.
+
+        Read from the export footer of the very file being post-processed, so the
+        receipt can put a measured number next to its own estimate instead of
+        leaving the reader to trust the model alone.
+        """
+        try:
+            footer = parse_gcode_footer(gcode_text)
+        except Exception as exc:
+            log.debug('footer parse failed: %s', exc)
+            return {}
+        out = {}
+        if footer.get('filament_g') is not None:
+            out['measured_filament_g'] = footer['filament_g']
+        if footer.get('print_time_s') is not None:
+            out['measured_print_time_s'] = footer['print_time_s']
+        return out
 
     def _aggregate_stats(self) -> dict:
         if not self.analyses:
@@ -1539,11 +1873,13 @@ PLUGIN_VERSION = __version__
 
 DEFAULT_CONFIG = {
     "description": "shelf bracket holding 8 kg, load downward; screwed to left wall",
+    "option": "balanced",
     "resolution": 32,
     "add_perimeters": 2,
     "max_extra_perimeters": 4,
     "enable_solid_infill": True,
     "enable_relax": True,
+    "enable_solid_downgrade": False,
 }
 
 
@@ -1585,10 +1921,23 @@ def _apply_config(pipe: EcoSlicePipeline, cfg_json: str) -> None:
     if isinstance(resolution, int) and 8 <= resolution <= 96:
         pipe.resolution = resolution
     mc = pipe.cfg
-    mc.add_perimeters = int(merged.get("add_perimeters", mc.add_perimeters))
-    mc.max_extra_perimeters = int(merged.get("max_extra_perimeters", mc.max_extra_perimeters))
-    mc.enable_solid_infill = bool(merged.get("enable_solid_infill", mc.enable_solid_infill))
-    mc.enable_relax = bool(merged.get("enable_relax", mc.enable_relax))
+    # An option preset seeds the mutation strength; explicit keys still win over it,
+    # so a user who edits a single value does not silently get the whole preset.
+    preset = PRESETS_BY_KEY.get(str(merged.get("option", "")).strip().lower())
+    if preset is not None:
+        mc.add_perimeters = preset.add_perimeters
+        mc.max_extra_perimeters = preset.max_extra_perimeters
+        mc.enable_solid_infill = preset.enable_solid_infill
+        mc.enable_relax = preset.enable_relax
+    for key, caster in (
+        ("add_perimeters", int),
+        ("max_extra_perimeters", int),
+        ("enable_solid_infill", bool),
+        ("enable_relax", bool),
+        ("enable_solid_downgrade", bool),
+    ):
+        if key in cfg:
+            setattr(mc, key, caster(cfg[key]))
 
 
 if orca is not None:

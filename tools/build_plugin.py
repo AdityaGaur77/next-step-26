@@ -4,6 +4,20 @@ import ast
 import sys
 from pathlib import Path
 
+# Some CPython 3.12 patch releases unparse an f-string that reuses the outer quote
+# inside the expression as f'{d['k']}' (PEP 701 syntax) instead of the f"{d['k']}"
+# that 3.11, 3.13 and later 3.12s emit. That output is byte-different from every
+# other interpreter's — failing CI's staleness gate — and is a syntax error before
+# 3.12. Probing the behaviour is exact where a version comparison is not: the
+# affected patch releases sit *inside* the 3.12 range, so no version bound
+# describes them.
+_UNPARSE_PROBE = "x = f'{d[\"k\"]}'"
+_UNPARSE_CANONICAL = 'x = f"{d[\'k\']}"'
+
+
+def unparse_is_canonical() -> bool:
+    return ast.unparse(ast.parse(_UNPARSE_PROBE)) == _UNPARSE_CANONICAL
+
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "ecoslice"
 OUT = ROOT / "plugin" / "ecoslice_core.py"
@@ -17,6 +31,7 @@ MODULE_ORDER = [
     ("host_bridge", "host_bridge"),
     ("mutate", "mutate"),
     ("receipt", "receipt"),
+    ("options", "options"),
     ("pipeline", "pipeline"),
 ]
 
@@ -52,11 +67,13 @@ PLUGIN_VERSION = __version__
 
 DEFAULT_CONFIG = {
     "description": "shelf bracket holding 8 kg, load downward; screwed to left wall",
+    "option": "balanced",
     "resolution": 32,
     "add_perimeters": 2,
     "max_extra_perimeters": 4,
     "enable_solid_infill": True,
     "enable_relax": True,
+    "enable_solid_downgrade": False,
 }
 
 
@@ -98,10 +115,23 @@ def _apply_config(pipe: EcoSlicePipeline, cfg_json: str) -> None:
     if isinstance(resolution, int) and 8 <= resolution <= 96:
         pipe.resolution = resolution
     mc = pipe.cfg
-    mc.add_perimeters = int(merged.get("add_perimeters", mc.add_perimeters))
-    mc.max_extra_perimeters = int(merged.get("max_extra_perimeters", mc.max_extra_perimeters))
-    mc.enable_solid_infill = bool(merged.get("enable_solid_infill", mc.enable_solid_infill))
-    mc.enable_relax = bool(merged.get("enable_relax", mc.enable_relax))
+    # An option preset seeds the mutation strength; explicit keys still win over it,
+    # so a user who edits a single value does not silently get the whole preset.
+    preset = PRESETS_BY_KEY.get(str(merged.get("option", "")).strip().lower())
+    if preset is not None:
+        mc.add_perimeters = preset.add_perimeters
+        mc.max_extra_perimeters = preset.max_extra_perimeters
+        mc.enable_solid_infill = preset.enable_solid_infill
+        mc.enable_relax = preset.enable_relax
+    for key, caster in (
+        ("add_perimeters", int),
+        ("max_extra_perimeters", int),
+        ("enable_solid_infill", bool),
+        ("enable_relax", bool),
+        ("enable_solid_downgrade", bool),
+    ):
+        if key in cfg:
+            setattr(mc, key, caster(cfg[key]))
 
 
 if orca is not None:
@@ -257,6 +287,16 @@ def render_imports(entries: list[tuple]) -> str:
 
 
 def main() -> int:
+    if not unparse_is_canonical():
+        have = ".".join(str(v) for v in sys.version_info[:3])
+        print(
+            f"error: this interpreter (Python {have}) unparses f-strings in the PEP 701 form,\n"
+            f"       which is byte-different from every other interpreter's output and would\n"
+            f"       fail CI's bundle-staleness gate. Build with another interpreter\n"
+            f"       (3.11, 3.13, or a current 3.12): pythonX.Y tools/build_plugin.py",
+            file=sys.stderr,
+        )
+        return 2
     local_names = {label for _, label in MODULE_ORDER} | {"ecoslice"}
     bodies = []
     imports: list[str] = []
