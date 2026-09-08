@@ -1,5 +1,7 @@
 # EcoSlice
 
+**[adityagaur77.github.io/next-step-26](https://adityagaur77.github.io/next-step-26/)** — project page, with a worked example of the analysis output.
+
 [![CI](https://github.com/AdityaGaur77/next-step-26/actions/workflows/ci.yml/badge.svg)](https://github.com/AdityaGaur77/next-step-26/actions/workflows/ci.yml)
 
 **Load-aware walls & infill for OrcaSlicer.** Slicers know the *shape* of a part — never its *job*.
@@ -54,6 +56,7 @@ was 10–40× slower and needed >1 GB at those sizes, which is why the solver la
 | `spike/spike_extra_perimeters.py` | day-1 gate: prove graph mutation changes G-code |
 | `tools/build_plugin.py` | regenerates `plugin/ecoslice_core.py` from `src/` (refuses on a non-canonical `ast.unparse`) |
 | `tools/stress_report.py` | self-contained HTML proof: stress field vs the decisions taken from it |
+| `tools/build_site.py` | regenerates the GitHub Pages site in `docs/` from a real analysis run |
 | `tools/demo.py` | one command: parts + analyses + proof pages + a run-order sheet |
 | `tools/make_test_part.py` | watertight test STLs sized to actually stress under a realistic load |
 | `tools/verify_gcode.py` | did EcoSlice actually run on this export? names the failure mode |
@@ -168,6 +171,15 @@ bottom or bridge surfaces. It is **off by default** because it thins shells the 
   with a confidence score; a human-readable `;ECOSLICE` receipt in the G-code. (Config is the
   slicer's JSON editor today — an HTML config UI via `get_config_ui()` is the next design step.)
 - **Technology** — real FEA inside a slicer's live slicing graph.
+
+## Project page
+
+`docs/index.html` and `docs/proof-example.html` are generated — the stress maps on the landing
+page come from an actual FEM solve at build time, so the page cannot drift from what the tool
+does. Rebuild with `python tools/build_site.py`.
+
+To publish: repo **Settings → Pages → Deploy from a branch → `main` / `docs`**. The site is then
+served at `https://adityagaur77.github.io/next-step-26/`.
 
 ## License
 
