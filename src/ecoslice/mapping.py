@@ -15,6 +15,7 @@ class LayerAction:
     p95_utilization: float
     n_voxels: int
     median_utilization: float = 0.0
+    occupied_xy: np.ndarray | None = None
 
 
 @dataclass
@@ -77,6 +78,7 @@ def plan_from_stress(
 
         col_hot = (uband >= reinforce_frac).any(axis=2)
         col_cold = (uband <= relax_frac).all(axis=2)
+        col_occupied = band.any(axis=2)
 
         hot_count = int(col_hot.sum())
         if mean_u >= reinforce_frac or (p95_u >= hotspot_frac and hot_count >= min_reinforce_columns_per_layer):
@@ -100,6 +102,7 @@ def plan_from_stress(
             p95_utilization=p95_u,
             n_voxels=n_vox,
             median_utilization=med_u,
+            occupied_xy=col_occupied,
         )
         plan.actions.append(action)
         if reinforce.any():

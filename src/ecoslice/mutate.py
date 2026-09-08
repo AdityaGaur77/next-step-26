@@ -9,11 +9,13 @@ from .host_bridge import (
     get_fill_surfaces,
     get_layer_z,
     guess_scale,
+    is_downgradable_solid,
     is_sparse_like,
     iter_layers,
     iter_regions,
     object_footprint_mm,
     set_extra_perimeters,
+    set_surface_sparse,
     set_surface_type,
     slice_bbox_mm,
     surface_centroid_xy_mm,
@@ -29,6 +31,12 @@ class MutationConfig:
     enable_solid_infill: bool = True
     enable_relax: bool = True
     solid_type: str = "internal_solid"
+    # Relaxing extra perimeters only removes material from a profile that already
+    # adds them; on a stock profile `extra_perimeters` starts at 0 and there is
+    # nothing to take away. Downgrading density-driven internal solid infill back
+    # to sparse in cold columns is the lever that removes material either way.
+    # Off by default: it thins shells the slicer added, so it is opt-in.
+    enable_solid_downgrade: bool = False
 
 
 @dataclass
@@ -36,6 +44,7 @@ class MutationStats:
     surfaces_reinforced: int = 0
     surfaces_solidified: int = 0
     surfaces_relaxed: int = 0
+    surfaces_desolidified: int = 0
     surfaces_skipped_no_xy: int = 0
     perimeters_added: int = 0
     perimeters_removed: int = 0
@@ -44,6 +53,7 @@ class MutationStats:
         self.surfaces_reinforced += other.surfaces_reinforced
         self.surfaces_solidified += other.surfaces_solidified
         self.surfaces_relaxed += other.surfaces_relaxed
+        self.surfaces_desolidified += other.surfaces_desolidified
         self.surfaces_skipped_no_xy += other.surfaces_skipped_no_xy
         self.perimeters_added += other.perimeters_added
         self.perimeters_removed += other.perimeters_removed
@@ -191,6 +201,9 @@ def apply_to_region(
             if cur > 0 and set_extra_perimeters(surface, 0):
                 stats.surfaces_relaxed += 1
                 stats.perimeters_removed += cur
+            if cfg.enable_solid_downgrade and is_downgradable_solid(surface):
+                if set_surface_sparse(surface):
+                    stats.surfaces_desolidified += 1
 
     return stats
 

@@ -9,7 +9,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin" / "ecoslice_core.py"
 
-
 @pytest.fixture(scope="module")
 def bundled():
     assert PLUGIN.exists(), "run tools/build_plugin.py first"
@@ -20,12 +19,25 @@ def bundled():
     return mod
 
 
-def test_header_and_metadata(bundled):
+def test_pep723_header_is_well_formed():
+    """Pure-text check: runs on every supported interpreter, bundle import or not."""
     text = PLUGIN.read_text(encoding="utf-8")
     assert text.startswith("# /// script")
     header = text.split("# ///")[1]
     assert 'requires-python = ">=3.12"' in text
     assert "numpy" in header and "scipy" in header
+    assert "[tool.orcaslicer.plugin]" in header, "identity keys must sit in the TOML table"
+    assert "name = " in header
+
+
+def test_no_relative_imports_in_bundle_text():
+    src = PLUGIN.read_text(encoding="utf-8")
+    for i, line in enumerate(src.splitlines(), 1):
+        if line.startswith("from .") or line.startswith("from ecoslice"):
+            pytest.fail(f"intra-package import survived bundling at line {i}: {line}")
+
+
+def test_describe_reports_the_capability(bundled):
     d = bundled.describe()
     assert d["name"] == "EcoSlice"
     assert "SlicingPipeline" in d["capabilities"]
@@ -65,10 +77,3 @@ def test_config_round_trips_into_the_pipeline(bundled):
 
     bundled._apply_config(pipe, "not json at all")
     assert pipe.resolution == bundled.DEFAULT_CONFIG["resolution"]
-
-
-def test_no_relative_imports_in_bundle(bundled):
-    src = PLUGIN.read_text(encoding="utf-8")
-    for i, line in enumerate(src.splitlines(), 1):
-        if line.startswith("from .") or line.startswith("from ecoslice"):
-            pytest.fail(f"intra-package import survived bundling at line {i}: {line}")

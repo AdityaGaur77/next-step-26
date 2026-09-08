@@ -14,13 +14,20 @@ from .host_bridge import (
     probe,
 )
 from .receipt import (
-    co2e_g,
-    grams_from_volume_mm3,
+    parse_gcode_footer,
     receipt_block,
+)
+from .options import (
+    DEFAULT_SPARSE_INFILL_DENSITY,
+    Confidence,
+    OptionReport,
+    build_options,
+    estimate_material,
+    strength_confidence,
 )
 from .fem import canonical_face, opposite_face, solve_voxel_fem
 from .loadcase import LoadCase, extract_load_case
-from .mapping import Plan, plan_from_stress, region_boundary_length_mm
+from .mapping import Plan, plan_from_stress
 from .mutate import MutationConfig, MutationStats, apply_plan_to_object, compute_alignment
 from .voxelize import voxelize
 
@@ -40,6 +47,8 @@ class Analysis:
     wall_seconds: float
     savings: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    confidence: Confidence | None = None
+    options: list[OptionReport] = field(default_factory=list)
 
     def stats(self, cfg: MutationConfig, mutation: MutationStats | None = None) -> dict:
         d = {
@@ -55,12 +64,15 @@ class Analysis:
             "relaxed_layers": self.plan.n_relaxed_layers,
             "analysis_seconds": round(self.wall_seconds, 2),
         }
+        if self.confidence is not None:
+            d.update(self.confidence.as_dict())
         if self.notes:
             d["notes"] = "; ".join(self.notes)
         if mutation is not None:
             d["perimeters_added"] = mutation.perimeters_added
             d["perimeters_removed"] = mutation.perimeters_removed
             d["surfaces_solidified"] = mutation.surfaces_solidified
+            d["surfaces_desolidified"] = mutation.surfaces_desolidified
         d.update(self.savings)
         return d
 
@@ -73,12 +85,14 @@ class EcoSlicePipeline:
         load_case: LoadCase | None = None,
         resolution: int = DEFAULT_RESOLUTION,
         layer_height_mm: float | None = None,
+        infill_density: float = DEFAULT_SPARSE_INFILL_DENSITY,
     ):
         self.cfg = cfg or MutationConfig()
         self.description = description or ""
         self._explicit_load_case = load_case
         self.resolution = resolution
         self.layer_height_mm = layer_height_mm
+        self.infill_density = infill_density
         self.analyses: dict[str, Analysis] = {}
         self.capabilities: HostCapabilities | None = None
         self._last_mutation: MutationStats | None = None
@@ -163,31 +177,28 @@ class EcoSlicePipeline:
             wall_seconds=time.perf_counter() - t0,
             notes=notes,
         )
+        analysis.confidence = strength_confidence(plan, grid, fem.von_mises)
         analysis.savings = self._estimate_savings(plan, grid)
+        analysis.options = build_options(
+            grid,
+            fem.von_mises,
+            yield_mpa=lc.yield_mpa,
+            safety_factor=lc.safety_factor,
+            layer_height_mm=self.layer_height_mm,
+            infill_density=self.infill_density,
+        )
         self.analyses[object_id] = analysis
         return analysis
 
     def _estimate_savings(self, plan: Plan, grid) -> dict:
-        line_width = 0.42
-        lh = self.layer_height_mm or 0.2
-        h = grid.h
-        added_vol = 0.0
-        uniform_vol = 0.0
-        for a in plan.actions:
-            n_print_layers = max(1, int(round((a.z1_mm - a.z0_mm) / lh)))
-            hot_len = region_boundary_length_mm(a.reinforce_xy, h)
-            all_len = region_boundary_length_mm(np.ones_like(a.reinforce_xy), h)
-            added_vol += hot_len * self.cfg.add_perimeters * line_width * lh * n_print_layers
-            uniform_vol += all_len * self.cfg.add_perimeters * line_width * lh * n_print_layers
-        added_g = grams_from_volume_mm3(added_vol)
-        uniform_g = grams_from_volume_mm3(uniform_vol)
-        saved = max(uniform_g - added_g, 0.0)
-        return {
-            "added_grams": round(added_g, 3),
-            "uniform_baseline_grams": round(uniform_g, 3),
-            "saved_vs_uniform_grams": round(saved, 3),
-            "co2e_saved_vs_uniform_g": round(co2e_g(saved), 2),
-        }
+        return estimate_material(
+            plan,
+            grid,
+            add_perimeters=self.cfg.add_perimeters,
+            layer_height_mm=self.layer_height_mm or 0.2,
+            enable_solid_infill=self.cfg.enable_solid_infill,
+            infill_density=self.infill_density,
+        )
 
     def run_offline(self, vertices, triangles, description: str, object_id: str = "obj") -> Analysis:
         return self.analyze_mesh(vertices, triangles, description, object_id)
@@ -229,6 +240,12 @@ class EcoSlicePipeline:
                 log.info("host capabilities: %s", self.capabilities.as_dict())
             if self.layer_height_mm is None:
                 self.layer_height_mm = _config_float(ctx, "layer_height")
+            density = _config_float(ctx, "sparse_infill_density")
+            if density is None:
+                density = _config_float(ctx, "fill_density")
+            if density is not None and 0.0 <= density <= 100.0:
+                # OrcaSlicer reports this as a percentage; the material model wants a fraction.
+                self.infill_density = density / 100.0 if density > 1.0 else density
             for obj in iter_print_objects(ctx):
                 if object_key(obj) in self.analyses:
                     continue
@@ -267,7 +284,9 @@ class EcoSlicePipeline:
 
     def on_gcode_postprocess(self, gcode_text: str) -> str:
         try:
-            block = receipt_block(self._aggregate_stats())
+            stats = self._aggregate_stats()
+            stats.update(self._measured_stats(gcode_text))
+            block = receipt_block(stats)
             lines = [ln for ln in gcode_text.splitlines() if not ln.startswith(";ECOSLICE")]
             insert_at = 0
             for i, ln in enumerate(lines[:50]):
@@ -278,6 +297,25 @@ class EcoSlicePipeline:
         except Exception as exc:
             log.exception("postprocess hook failed (non-fatal): %s", exc)
             return gcode_text
+
+    def _measured_stats(self, gcode_text: str) -> dict:
+        """Filament mass and print time as the slicer itself reported them.
+
+        Read from the export footer of the very file being post-processed, so the
+        receipt can put a measured number next to its own estimate instead of
+        leaving the reader to trust the model alone.
+        """
+        try:
+            footer = parse_gcode_footer(gcode_text)
+        except Exception as exc:
+            log.debug("footer parse failed: %s", exc)
+            return {}
+        out = {}
+        if footer.get("filament_g") is not None:
+            out["measured_filament_g"] = footer["filament_g"]
+        if footer.get("print_time_s") is not None:
+            out["measured_print_time_s"] = footer["print_time_s"]
+        return out
 
     def _aggregate_stats(self) -> dict:
         if not self.analyses:

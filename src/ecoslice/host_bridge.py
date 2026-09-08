@@ -11,6 +11,8 @@ SCALED_UNITS_PER_MM = 1_000_000.0
 SCALE_GUESSES = (1_000_000.0, 1_000.0, 1.0)
 
 SOLID_ENUM_NAMES = ("stInternalSolid", "stSolid", "InternalSolid")
+SPARSE_ENUM_NAMES = ("stInternal", "Internal")
+DOWNGRADABLE_ENUM_NAMES = ("stInternalSolid",)
 SOLID_TYPE_NAMES = ("internal_solid", "internalsolid", "solid", "stinternalsolid")
 SPARSE_HINTS = ("internal", "sparse", "infill")
 
@@ -390,6 +392,51 @@ def solid_surface_type(surface, fallback: str = "internal_solid"):
         if member is not None:
             return member
     return fallback
+
+
+def sparse_surface_type(surface, fallback: str = "internal"):
+    """The value meaning ordinary sparse internal infill, resolved like `solid_surface_type`."""
+    current = get_surface_type(surface)
+    if current is None or isinstance(current, str):
+        return fallback
+    cls = type(current)
+    for name in SPARSE_ENUM_NAMES:
+        member = getattr(cls, name, None)
+        if member is not None:
+            return member
+    return fallback
+
+
+def is_downgradable_solid(surface) -> bool:
+    """True only for density-driven internal solid infill (`stInternalSolid`).
+
+    Top, bottom and every bridge variant are load-bearing or visible shells that
+    the slicer created for a reason, so they are never candidates for being
+    thinned back out to sparse — only the internal solid the shell-thickness
+    logic added is.
+    """
+    st = get_surface_type(surface)
+    if st is None:
+        return False
+    if isinstance(st, str):
+        return st.strip().lower().replace("_", "") in ("internalsolid", "stinternalsolid")
+    name = getattr(st, "name", None) or str(st).rsplit(".", 1)[-1]
+    return name in DOWNGRADABLE_ENUM_NAMES
+
+
+def set_surface_sparse(surface) -> bool:
+    """Reclassify a solid internal surface back to sparse infill."""
+    if not is_downgradable_solid(surface):
+        return False
+    value = sparse_surface_type(surface)
+    for attr in ("surface_type", "type_"):
+        if hasattr(surface, attr):
+            try:
+                setattr(surface, attr, value)
+                return True
+            except Exception as exc:
+                log.debug("set_surface_sparse failed on %r: %s", attr, exc)
+    return False
 
 
 def set_surface_type(surface, solid_type=None) -> bool:
