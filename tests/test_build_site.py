@@ -8,18 +8,17 @@ import build_site
 
 
 @pytest.fixture(scope="module")
-def built(tmp_path_factory, monkeypatch_module=None):
-    """Build the site once, at a low resolution, into a temp directory."""
+def built(tmp_path_factory):
+    """Build the site once, at a low resolution, somewhere scratch."""
     out = tmp_path_factory.mktemp("site")
-    orig = (build_site.OUT_DIR, build_site.INDEX, build_site.PROOF)
-    build_site.OUT_DIR = out
-    build_site.INDEX = out / "index.html"
-    build_site.PROOF = out / "proof-example.html"
-    try:
-        info = build_site.build(resolution=24, test_count=99)
-        yield out, info
-    finally:
-        build_site.OUT_DIR, build_site.INDEX, build_site.PROOF = orig
+    return out, build_site.build(resolution=24, test_count=99, out_dir=out)
+
+
+def test_build_does_not_touch_the_committed_pages(built):
+    """A smoke run must be able to build without clobbering what is checked in."""
+    out, info = built
+    assert info["index"].parent == out
+    assert build_site.INDEX.parent != out
 
 
 def test_both_pages_are_written(built):

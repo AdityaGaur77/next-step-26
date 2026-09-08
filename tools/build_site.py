@@ -99,9 +99,14 @@ def count_tests() -> int | None:
     return collected[0]
 
 
-def build(resolution: int = RESOLUTION, test_count: int | None = -1) -> dict:
+def build(
+    resolution: int = RESOLUTION,
+    test_count: int | None = -1,
+    out_dir: Path | None = None,
+) -> dict:
     # test_count=-1 means "go and count them"; tests pass a value instead, so the
-    # suite never re-enters pytest to build a page.
+    # suite never re-enters pytest to build a page. out_dir lets a smoke run build
+    # somewhere scratch instead of overwriting the committed pages.
     v, t = PARTS[PART][0]()
     pipe = EcoSlicePipeline(description=DESCRIPTION, resolution=resolution, layer_height_mm=0.2)
     analysis = pipe.analyze_mesh(v, t, DESCRIPTION, PART)
@@ -110,8 +115,10 @@ def build(resolution: int = RESOLUTION, test_count: int | None = -1) -> dict:
     vmax = float(elev.utilization.max())
     material = analysis.options[1].material  # Balanced
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    PROOF.write_text(
+    out = out_dir or OUT_DIR
+    index_path, proof_path = out / INDEX.name, out / PROOF.name
+    out.mkdir(parents=True, exist_ok=True)
+    proof_path.write_text(
         render_report(analysis, "shelf bracket", receipt_block(analysis.stats(pipe.cfg))),
         encoding="utf-8",
     )
@@ -135,24 +142,29 @@ def build(resolution: int = RESOLUTION, test_count: int | None = -1) -> dict:
         leftovers = set(re.findall(r"__[A-Z_]+__", html))
         if leftovers:
             raise SystemExit(f"unfilled template tokens: {sorted(leftovers)}")
-    INDEX.write_text(html, encoding="utf-8")
+    index_path.write_text(html, encoding="utf-8")
 
     return {
         "peak_utilization": round(vmax, 3),
         "added_grams": material["added_grams"],
         "tests": n_tests,
-        "index_bytes": INDEX.stat().st_size,
-        "proof_bytes": PROOF.stat().st_size,
+        "index": index_path,
+        "index_bytes": index_path.stat().st_size,
+        "proof": proof_path,
+        "proof_bytes": proof_path.stat().st_size,
     }
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Build the GitHub Pages site into docs/.")
     ap.add_argument("--resolution", type=int, default=RESOLUTION)
+    ap.add_argument("--out", help="build somewhere other than docs/ (for smoke runs)")
     args = ap.parse_args(argv)
-    info = build(args.resolution)
-    print(f"wrote {INDEX.relative_to(ROOT)} ({info['index_bytes'] / 1024:.0f} KB)")
-    print(f"wrote {PROOF.relative_to(ROOT)} ({info['proof_bytes'] / 1024:.0f} KB)")
+    info = build(args.resolution, out_dir=Path(args.out) if args.out else None)
+    for key in ("index", "proof"):
+        path = info[key]
+        shown = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+        print(f"wrote {shown} ({info[key + '_bytes'] / 1024:.0f} KB)")
     print(f"peak utilisation {info['peak_utilization']}x, balanced adds {info['added_grams']} g")
     print(f"test count on the page: {info['tests'] if info['tests'] else 'omitted (pytest unavailable)'}")
     print("\nPublish: repo Settings -> Pages -> Deploy from a branch -> main / docs")
